@@ -1,7 +1,7 @@
 import subprocess
 import pytest
-from agent.mcp.git import Git
-from agent.mcp.workspace import Workspace
+from agent.mcp_.git import Git
+from agent.mcp_.workspace import Workspace
 
 
 def run_git(path, *args):
@@ -14,6 +14,7 @@ def run_git(path, *args):
         text=True,
     )
 
+
 @pytest.fixture
 def git_repo(tmp_path):
     run_git(tmp_path, "init")
@@ -21,6 +22,7 @@ def git_repo(tmp_path):
     run_git(tmp_path, "config", "user.email", "test@example.com")
 
     return Git(Workspace(tmp_path))
+
 
 def test_status_non_repository(tmp_path):
     git = Git(Workspace(tmp_path))
@@ -34,6 +36,7 @@ def test_status_non_repository(tmp_path):
     assert result["unstaged"] == []
     assert result["untracked"] == []
 
+
 def test_status_clean_repository(git_repo):
     result = git_repo.status()
 
@@ -44,6 +47,7 @@ def test_status_clean_repository(git_repo):
     assert result["unstaged"] == []
     assert result["untracked"] == []
     assert result["conflicted"] == []
+
 
 def test_status_untracked_file(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -56,6 +60,7 @@ def test_status_untracked_file(git_repo):
     assert result["untracked"] == [
         {"path": "test.txt"}
     ]
+
 
 def test_status_staged_file(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -70,6 +75,7 @@ def test_status_staged_file(git_repo):
     assert len(result["staged"]) == 1
     assert result["staged"][0]["path"] == "test.txt"
     assert result["staged"][0]["index_status"] == "A"
+
 
 def test_status_unstaged_file(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -87,10 +93,12 @@ def test_status_unstaged_file(git_repo):
     assert len(result["unstaged"]) == 1
     assert result["unstaged"][0]["path"] == "test.txt"
 
+
 def test_current_branch(git_repo):
     run_git(git_repo.workspace.root, "checkout", "-b", "feature/test")
 
     assert git_repo.current_branch() == "feature/test"
+
 
 def test_diff_unstaged(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -108,6 +116,7 @@ def test_diff_unstaged(git_repo):
     assert "modified" in result["diff"]
     assert "original" in result["diff"]
 
+
 def test_diff_staged(git_repo):
     path = git_repo.workspace.resolve("test.txt")
     path.write_text("original\n", encoding="utf-8")
@@ -124,6 +133,7 @@ def test_diff_staged(git_repo):
     assert result["staged"] is True
     assert "modified" in result["diff"]
     assert "original" in result["diff"]
+
 
 def test_diff_path_filter(git_repo):
     first = git_repo.workspace.resolve("first.txt")
@@ -143,6 +153,7 @@ def test_diff_path_filter(git_repo):
     assert result["ok"] is True
     assert "first modified" in result["diff"]
     assert "second modified" not in result["diff"]
+
 
 def test_log(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -169,12 +180,14 @@ def test_log(git_repo):
         assert commit["author"] == "Test User"
         assert commit["date"]
 
+
 def test_log_rejects_invalid_count(git_repo):
     with pytest.raises(ValueError):
         git_repo.log(max_count=0)
 
     with pytest.raises(ValueError):
         git_repo.log(max_count=101)
+
 
 def test_show_commit(git_repo):
     path = git_repo.workspace.resolve("test.txt")
@@ -189,6 +202,7 @@ def test_show_commit(git_repo):
     assert result["revision"] == "HEAD"
     assert "Initial commit" in result["content"]
     assert "hello" in result["content"]
+
 
 def test_show_commit_path_filter(git_repo):
     first = git_repo.workspace.resolve("first.txt")
@@ -206,13 +220,16 @@ def test_show_commit_path_filter(git_repo):
     assert "first" in result["content"]
     assert "second" not in result["content"]
 
+
 def test_git_path_rejects_absolute_path(git_repo, tmp_path):
     with pytest.raises(ValueError, match="Absolute paths are not allowed"):
         git_repo.diff(path="/etc/passwd")
 
+
 def test_git_path_rejects_workspace_escape(git_repo):
     with pytest.raises(ValueError, match="Path escapes workspace"):
         git_repo.diff(path="../outside.txt")
+
 
 def test_show_rejects_empty_revision(git_repo):
     with pytest.raises(ValueError, match="revision cannot be empty"):

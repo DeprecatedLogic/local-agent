@@ -1,11 +1,12 @@
 import pytest
-from agent.mcp.search import Search
-from agent.mcp.workspace import Workspace
+from agent.mcp_.search import Search
+from agent.mcp_.workspace import Workspace
 
 
 @pytest.fixture
 def search(tmp_path):
     return Search(Workspace(tmp_path))
+
 
 def test_search_in_file(search):
     search.workspace.resolve("test.py").write_text(
@@ -30,6 +31,7 @@ def test_search_in_file(search):
         },
     ]
 
+
 def test_search_in_file_case_insensitive(search):
     search.workspace.resolve("test.py").write_text(
         "Hello\n"
@@ -45,6 +47,7 @@ def test_search_in_file_case_insensitive(search):
     )
 
     assert len(result) == 3
+
 
 def test_search_files(search):
     search.workspace.resolve("a.py").write_text(
@@ -66,6 +69,7 @@ def test_search_files(search):
         }
     ]
 
+
 def test_search_files_respects_max_results(search):
     for i in range(5):
         search.workspace.resolve(f"{i}.txt").write_text(
@@ -77,9 +81,11 @@ def test_search_files_respects_max_results(search):
 
     assert len(result) == 2
 
+
 def test_search_rejects_empty_pattern(search):
     with pytest.raises(ValueError, match="pattern cannot be empty"):
         search.search_files("")
+
 
 def test_search_ignores_git_and_build_directories(search):
     search.workspace.resolve(".git").mkdir()

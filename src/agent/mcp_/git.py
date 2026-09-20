@@ -1,11 +1,9 @@
 from __future__ import annotations
-
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-
-from .workspace import Workspace
+from agent.mcp_.workspace import Workspace
 
 
 @dataclass

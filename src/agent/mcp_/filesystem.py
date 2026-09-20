@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 import os
 from pathlib import Path
-
-from .workspace import Workspace
+from agent.mcp_.workspace import Workspace
 
 
 class Filesystem:
@@ -25,6 +23,8 @@ class Filesystem:
             lines = f.readlines()
 
         total = len(lines)
+        if total == 0:
+            return {}
 
         if start_line is None:
             start_line = 1

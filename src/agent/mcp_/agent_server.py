@@ -1,12 +1,13 @@
 from __future__ import annotations
-
+import asyncio
 from fastmcp import FastMCP
-
-from agent.mcp.filesystem import Filesystem
-from agent.mcp.search import Search
-from agent.mcp.workspace import Workspace
+from agent.mcp_.filesystem import Filesystem
+from agent.mcp_.search import Search
+from agent.mcp_.workspace import Workspace
 from agent.state import StateStore
-from agent.mcp.git import Git
+from agent.mcp_.git import Git
+from agent.command import CommandExecutor
+
 
 class AgentServer:
     def __init__(self, workspace_path: str):
@@ -66,44 +67,59 @@ class AgentServer:
 
         @self.mcp.tool()
         def set_task_state(
-            task: str | None = None,
-            status: str | None = None,
             current: str | None = None,
+            completed: list[str] | None = None,
+            blocked: list[str] | None = None,
         ) -> dict:
             """
-            Update one or more fields of the persistent agent task state.
+            Update the model-managed fields of the persistent agent task state.
 
             Args:
-                task:
-                    Optional description of the overall task.
-                    If omitted, the existing task description is preserved.
-
-                status:
-                    Optional task status.
-                    If omitted, the existing status is preserved.
-
                 current:
                     Optional description of the work currently being performed.
                     If omitted, the existing value is preserved.
+                    An empty string clears the current work description.
+
+                completed:
+                    Optional complete list of task items the model considers
+                    completed.
+                    If omitted, the existing list is preserved.
+                    If provided, the existing list is replaced entirely.
+                    An empty list clears the completed items.
+
+                blocked:
+                    Optional complete list of task items or reasons the model
+                    currently considers blocked.
+                    If omitted, the existing list is preserved.
+                    If provided, the existing list is replaced entirely.
+                    An empty list clears the blocked items.
 
             Returns:
                 The complete updated task state.
 
             Notes:
-                Only arguments explicitly provided are changed.
-                Existing completed, blocked, and files fields are preserved.
+                The model may reorganize its understanding of task progress.
+                Therefore completed and blocked are replacement-based rather than
+                append-only.
+
+                The following fields are runtime-owned and cannot be changed by
+                this operation:
+                - task: overall task description supplied by the user.
+                - status: runtime-controlled task lifecycle status.
+                - files: files modified or created by the runtime.
+
                 This operation modifies persistent task state.
             """
             state = self.state.load()
 
-            if task is not None:
-                state.task = task
-
-            if status is not None:
-                state.status = status
-
             if current is not None:
                 state.current = current
+
+            if completed is not None:
+                state.completed = completed
+
+            if blocked is not None:
+                state.blocked = blocked
 
             self.state.save(state)
 
@@ -137,6 +153,7 @@ class AgentServer:
             Notes:
                 Only files inside the configured workspace can be accessed.
                 This operation does not modify the file.
+                An empty file returns an empty dictionary.
             """
             return self.filesystem.read_file(
                 path,
@@ -532,6 +549,22 @@ class AgentServer:
                 revision=revision,
                 path=path,
             )
+        
+        @self.mcp.tool()
+        def move_item(old_path: str, new_path: str) -> dict:
+            """Move or rename a file/folder inside the workspace."""
+            return self.filesystem.move_item(old_path, new_path)
+
+        @self.mcp.tool()
+        def delete_item(path: str) -> dict:
+            """Delete a file or empty directory inside the workspace."""
+            return self.filesystem.delete_item(path)
+
+        @self.mcp.tool()
+        async def run_command(command: str, timeout: float = 30.0) -> dict:
+            """Execute a shell command inside the workspace with bounded output."""
+            executor = CommandExecutor(workspace=self.workspace.root, timeout=timeout)
+            return await executor.run(command)
 
     def run(self) -> None:
         self.mcp.run()

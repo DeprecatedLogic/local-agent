@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 from pathlib import Path
-
-from .workspace import Workspace
+from agent.mcp_.workspace import Workspace
 
 
 class Search:
