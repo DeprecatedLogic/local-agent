@@ -1,3 +1,4 @@
+import pytest
 from agent.state import StateStore, TaskState
 
 
@@ -11,6 +12,7 @@ def test_task_state_defaults():
     assert state.blocked == []
     assert state.files == []
 
+
 def test_task_state_round_trip():
     state = TaskState(
         task="Implement Git support",
@@ -18,12 +20,13 @@ def test_task_state_round_trip():
         current="Testing Git status",
         completed=["Workspace", "Filesystem"],
         blocked=[],
-        files=["src/agent/mcp/git.py"],
+        files=["src/agent/mcp_/git.py"],
     )
 
     restored = TaskState.from_dict(state.to_dict())
 
     assert restored == state
+
 
 def test_state_store_missing_file(tmp_path):
     store = StateStore(tmp_path / ".agent/state.json")
@@ -31,6 +34,7 @@ def test_state_store_missing_file(tmp_path):
     state = store.load()
 
     assert state == TaskState()
+
 
 def test_state_store_save_and_load(tmp_path):
     store = StateStore(tmp_path / ".agent/state.json")
@@ -48,6 +52,7 @@ def test_state_store_save_and_load(tmp_path):
 
     assert store.load() == state
 
+
 def test_state_store_creates_parent_directory(tmp_path):
     path = tmp_path / ".agent" / "nested" / "state.json"
     store = StateStore(path)
@@ -55,6 +60,7 @@ def test_state_store_creates_parent_directory(tmp_path):
     store.save(TaskState(task="test"))
 
     assert path.is_file()
+
 
 def test_state_store_replaces_existing_state(tmp_path):
     store = StateStore(tmp_path / ".agent/state.json")

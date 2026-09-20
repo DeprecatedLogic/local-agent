@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
+import time
+import fcntl
+import os
 
 
 @dataclass
@@ -51,13 +54,27 @@ class StateStore:
     def save(self, state: TaskState) -> None:
         temporary = self.path.with_suffix(".tmp")
 
-        with temporary.open("w", encoding="utf-8") as f:
-            json.dump(
-                state.to_dict(),
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-            f.write("\n")
+        # Acquire exclusive advisory lock (non-blocking)
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
 
-        temporary.replace(self.path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Another process holds the lock. Retry once after 200ms.
+            time.sleep(0.2)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        try:
+            with temporary.open("w", encoding="utf-8") as f:
+                json.dump(
+                    state.to_dict(),
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                f.write("\n")
+            
+            temporary.replace(self.path)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
