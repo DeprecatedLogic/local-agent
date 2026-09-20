@@ -334,3 +334,13 @@ async def test_llama_cpp_client_configures_timeout():
     )
 
     assert client.timeout is custom_timeout
+
+    client = LlamaCppClient(
+        base_url="http://localhost:8080",
+        model="test-model",
+    )
+
+    assert client.timeout.connect == 10.0
+    assert client.timeout.read is None
+    assert client.timeout.write == 30.0
+    assert client.timeout.pool == 10.0
