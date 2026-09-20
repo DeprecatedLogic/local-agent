@@ -25,13 +25,13 @@ class LlamaCppClient:
         model: str,
         generation: GenerationConfig | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        timeout: float | None = 120.0,
+        timeout: httpx.Timeout | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.generation = generation or GenerationConfig()
         self.transport = transport
-        self.timeout = httpx.Timeout(
+        self.timeout = timeout or httpx.Timeout(
             connect=10.0,
             read=None,
             write=30.0,

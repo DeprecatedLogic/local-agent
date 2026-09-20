@@ -325,27 +325,12 @@ async def test_llama_cpp_client_uses_default_generation_config():
 
 @pytest.mark.anyio
 async def test_llama_cpp_client_configures_timeout():
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "OK",
-                        }
-                    }
-                ]
-            },
-        )
-    )
+    custom_timeout = httpx.Timeout(42.0)
 
     client = LlamaCppClient(
         base_url="http://localhost:8080",
         model="test-model",
-        transport=transport,
-        timeout=42.0,
+        timeout=custom_timeout,
     )
 
-    assert client.timeout == 42.0
+    assert client.timeout is custom_timeout
