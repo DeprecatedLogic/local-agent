@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-agent"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "fastmcp",
+    "httpx",
+    "cysystemd",
+    "pytest"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+local-agent = "agent.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "anyio>=4.0", "httpx>=0.25", "mypy>=1.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
