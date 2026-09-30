@@ -1,13 +1,15 @@
 import argparse
 import asyncio
 import inspect
-from pathlib import Path
+
 from cysystemd import daemon
+
+from agent.chat import ChatSession
+from agent.health import HealthMonitor
 from agent.logging_config import setup_logging
 from agent.mcp_.agent_server import AgentServer
 from agent.model import LlamaCppClient
 from agent.runtime import AgentRuntime
-from agent.health import HealthMonitor
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -17,7 +19,8 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--workspace",
-        required=True,
+        required=False,
+        default="/srv/local-agent-workspace",
         help="Path to the project workspace.",
     )
 
@@ -37,43 +40,85 @@ def create_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=50,
-        help="Maximum number of agent iterations.",
+        help=(
+            "Maximum number of agent iterations "
+            "per user turn."
+        ),
     )
-    
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simulate tool execution without modifying the workspace.",
+        help=(
+            "Simulate tool execution without "
+            "modifying the workspace."
+        ),
     )
-    
+
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help=(
+            "Start an interactive terminal chat "
+            "session."
+        ),
+    )
+
     parser.add_argument(
         "task",
         nargs="*",
-        help="Task for the agent. If omitted, read one line interactively.",
+        help=(
+            "Task for the agent. In chat mode, "
+            "this becomes the optional first "
+            "user message."
+        ),
     )
 
     return parser
 
 
-def create_runtime(args: argparse.Namespace, dry_run: bool = False) -> AgentRuntime:
+def create_runtime(
+    args: argparse.Namespace,
+    dry_run: bool = False,
+) -> AgentRuntime:
     server = AgentServer(args.workspace)
-    
+
     if dry_run:
-        # Automatically find all public methods that look like mutating filesystem tools
         fs = server.filesystem
+
         mutating_methods = [
-            name for name, method in inspect.getmembers(fs, predicate=inspect.ismethod)
+            name
+            for name, method
+            in inspect.getmembers(
+                fs,
+                predicate=inspect.ismethod,
+            )
             if not name.startswith("_")
-            and any(kw in name for kw in ("write", "edit", "create", "move", "delete", "remove"))
+            and any(
+                keyword in name
+                for keyword in (
+                    "write",
+                    "edit",
+                    "create",
+                    "move",
+                    "delete",
+                    "remove",
+                )
+            )
         ]
 
         for tool_name in mutating_methods:
-            original_tool = getattr(fs, tool_name)
-            # Capture the current value to avoid the late-binding bug
+            original_tool = getattr(
+                fs,
+                tool_name,
+            )
+
             setattr(
                 fs,
                 tool_name,
-                lambda *a, original=original_tool, **k: {
+                lambda *args,
+                original=original_tool,
+                **kwargs: {
                     "dry_run": True,
                     "original": str(original),
                 },
@@ -98,54 +143,105 @@ async def run_agent(
     return await runtime.run(task)
 
 
-def notify_systemd(message: str) -> None:
-    try:
-        daemon.sd_notify(message)
-    except (RuntimeError, OSError):
-        pass
+async def run_chat(
+    runtime: AgentRuntime,
+    initial_message: str | None = None,
+) -> None:
+    session = ChatSession(runtime)
 
-async def async_main() -> None:
-    parser = create_parser()
-    args = parser.parse_args()
-
-    setup_logging()
-
-    health = HealthMonitor(
-        state_path=Path(args.workspace) / ".agent" / "state.json",
-        interval=10.0,
+    await session.run(
+        initial_message=initial_message,
     )
 
+
+def _notify_systemd(
+    message: str,
+) -> None:
+    try:
+        daemon.sd_notify(message)
+    except RuntimeError:
+        # Running outside a systemd service.
+        pass
+
+
+async def async_main(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> None:
     runtime = create_runtime(
         args,
         dry_run=args.dry_run,
     )
 
-    task = " ".join(args.task).strip()
-
-    if not task:
-        try:
-            task = input("> ").strip()
-        except EOFError:
-            parser.error("no task was provided")
-
-    if not task:
-        parser.error("task cannot be empty")
-
-    notify_systemd("READY=1")
+    health = HealthMonitor(
+        state_path=runtime.server.state.path,
+        interval=10.0,
+    )
 
     await health.start()
 
+    _notify_systemd("READY=1")
+
     try:
-        result = await run_agent(runtime, task)
+        task = " ".join(
+            args.task
+        ).strip()
+
+        if args.chat:
+            await run_chat(
+                runtime,
+                initial_message=task or None,
+            )
+            return
+
+        if not task:
+            try:
+                task = (
+                    await asyncio.to_thread(
+                        input,
+                        "> ",
+                    )
+                ).strip()
+            except EOFError:
+                parser.error(
+                    "no task was provided"
+                )
+
+        if not task:
+            parser.error(
+                "task cannot be empty"
+            )
+
+        result = await run_agent(
+            runtime,
+            task,
+        )
+
         print(result)
+
     finally:
+        runtime.server.state.save(
+            runtime.server.state.load()
+        )
+
         await health.stop()
-        notify_systemd("STOPPING=1")
+
+        _notify_systemd("STOPPING=1")
 
 
 def main() -> None:
+    setup_logging()
+
+    parser = create_parser()
+    args = parser.parse_args()
+
     try:
-        asyncio.run(async_main())
+        asyncio.run(
+            async_main(
+                args,
+                parser,
+            )
+        )
     except KeyboardInterrupt:
         print("\nAgent interrupted.")
 

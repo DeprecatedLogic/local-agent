@@ -104,132 +104,259 @@ class AgentRuntime:
 
         self.server.state.save(state)
 
-    async def run(self, task: str) -> str:
-        self._initialize_task(task)
-
-        messages = [
+    def create_chat_history(self) -> list[dict[str, Any]]:
+        return [
             {
                 "role": "system",
                 "content": TASK_STATE_SYSTEM_PROMPT,
-            },
+            }
+        ]
+
+    async def run(self, task: str) -> str:
+        task = task.strip()
+
+        if not task:
+            raise ValueError(
+                "task cannot be empty"
+            )
+
+        self._initialize_task(task)
+
+        messages = self.create_chat_history()
+
+        messages.append(
             {
                 "role": "user",
                 "content": task,
-            },
-        ]
+            }
+        )
 
-        for i in range(self.max_iterations):
+        return await self._run_messages(
+            messages
+        )
+
+    async def run_chat_turn(self, messages: list[dict[str, Any]], user_message: str) -> str:
+        user_message = user_message.strip()
+
+        if not user_message:
+            raise ValueError(
+                "user_message cannot be empty"
+            )
+
+        if not messages:
+            messages.extend(
+                self.create_chat_history()
+            )
+
+        self._initialize_task(user_message)
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_message,
+            }
+        )
+
+        return await self._run_messages(
+            messages
+        )
+
+    async def _run_messages(self, messages: list[dict[str, Any]]) -> str:
+        for _ in range(self.max_iterations):
             self._tool_call_count = 0
 
             tools = await self._get_tools()
+
             response = await self.model.generate(
                 messages=messages,
                 tools=tools,
             )
 
-            agent_response = self._parse_response(response)
+            agent_response = (
+                self._parse_response(response)
+            )
+
             if agent_response.usage:
                 stats = (
-                    f"\n[Session Stats: Prompt={agent_response.usage['prompt_tokens']}, "
+                    "\n[Session Stats: "
+                    f"Prompt={agent_response.usage['prompt_tokens']}, "
                     f"Completion={agent_response.usage['completion_tokens']}, "
                     f"Total={agent_response.usage['total_tokens']}]"
                 )
-                messages.append({"role": "system", "content": stats})
+
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": stats,
+                    }
+                )
 
             if agent_response.error is not None:
-                messages.append({
-                    "role": "tool",
-                    "content": {
-                        "is_error": True,
-                        "error": agent_response.error,
-                    },
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": {
+                            "is_error": True,
+                            "error": agent_response.error,
+                        },
+                    }
+                )
                 continue
 
             if not agent_response.is_tool_call:
+                content = (
+                    agent_response.content or ""
+                )
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content,
+                    }
+                )
+
                 state = self.server.state.load()
                 state.status = "completed"
                 self.server.state.save(state)
+
                 self._last_heartbeat = {
                     "status": state.status,
                     "task": state.task,
-                    "iteration": self._tool_call_count,
-                    "last_tool": None,  # Updated in _execute_tool
+                    "iteration": (
+                        self._tool_call_count
+                    ),
+                    "last_tool": None,
                 }
 
-                return agent_response.content or ""
+                return content
 
-            tool_calls = agent_response.tool_calls
+            tool_calls = (
+                agent_response.tool_calls
+            )
 
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": tool_call["id"],
-                        "type": tool_call["type"],
-                        "function": {
-                            "name": tool_call["name"],
-                            "arguments": json.dumps(tool_call["arguments"]),
-                        },
-                    }
-                    for tool_call in tool_calls
-                ],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_call["id"],
+                            "type": (
+                                tool_call["type"]
+                            ),
+                            "function": {
+                                "name": (
+                                    tool_call["name"]
+                                ),
+                                "arguments": (
+                                    json.dumps(
+                                        tool_call[
+                                            "arguments"
+                                        ]
+                                    )
+                                ),
+                            },
+                        }
+                        for tool_call
+                        in tool_calls
+                    ],
+                }
+            )
 
             for tool_call in tool_calls:
-                tool_result = await self._execute_tool(tool_call)
+                tool_result = (
+                    await self._execute_tool(
+                        tool_call
+                    )
+                )
 
                 content = (
                     tool_result.structured_content
-                    if hasattr(tool_result, "structured_content")
+                    if hasattr(
+                        tool_result,
+                        "structured_content",
+                    )
                     else tool_result
                 )
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": json.dumps(content),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": (
+                            tool_call["id"]
+                        ),
+                        "content": (
+                            json.dumps(content)
+                        ),
+                    }
+                )
 
-        messages.append({
-            "role": "system",
-            "content": (
-                "The agent runtime stopped further execution because the maximum "
-                "iteration limit was reached. This was an automatic safety limit, "
-                "not a user request. You may summarize the current state, explain "
-                "what prevented completion, and identify what should happen next."
-            ),
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "The agent runtime stopped "
+                    "further execution because the "
+                    "maximum iteration limit was "
+                    "reached. This was an automatic "
+                    "safety limit, not a user request. "
+                    "You may summarize the current "
+                    "state, explain what prevented "
+                    "completion, and identify what "
+                    "should happen next."
+                ),
+            }
+        )
 
         response = await self.model.generate(
             messages=messages,
             tools=[],
         )
 
-        agent_response = self._parse_response(response)
+        agent_response = (
+            self._parse_response(response)
+        )
+
         if agent_response.usage:
-                stats = (
-                    f"\n[Session Stats: Prompt={agent_response.usage['prompt_tokens']}, "
-                    f"Completion={agent_response.usage['completion_tokens']}, "
-                    f"Total={agent_response.usage['total_tokens']}]"
-                )
-                messages.append({"role": "system", "content": stats})
+            stats = (
+                "\n[Session Stats: "
+                f"Prompt={agent_response.usage['prompt_tokens']}, "
+                f"Completion={agent_response.usage['completion_tokens']}, "
+                f"Total={agent_response.usage['total_tokens']}]"
+            )
+
+            messages.append(
+                {
+                    "role": "system",
+                    "content": stats,
+                }
+            )
 
         if agent_response.error is not None:
             raise RuntimeError(
-                f"Failed to generate final response after iteration limit: "
+                "Failed to generate final response "
+                "after iteration limit: "
                 f"{agent_response.error}"
             )
+
+        content = agent_response.content or ""
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+            }
+        )
 
         state = self.server.state.load()
         state.status = "blocked"
         state.blocked.append(
-            "Maximum iteration limit reached before task completion."
+            "Maximum iteration limit reached "
+            "before task completion."
         )
         self.server.state.save(state)
 
-        return agent_response.content or ""
+        return content
 
     def _initialize_task(self, task: str) -> None:
         state = self.server.state.load()
