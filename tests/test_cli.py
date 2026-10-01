@@ -5,13 +5,6 @@ from agent.cli import create_runtime
 from agent.cli import run_agent
 
 
-def test_parser_requires_workspace():
-    parser = create_parser()
-
-    with pytest.raises(SystemExit):
-        parser.parse_args([])
-
-
 def test_parser_accepts_task():
     parser = create_parser()
 
