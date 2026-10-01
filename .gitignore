@@ -10,3 +10,5 @@ venv/
 
 # Agent runtime data
 .agent/
+
+build
