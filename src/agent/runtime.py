@@ -6,7 +6,7 @@ from fastmcp.exceptions import ToolError
 import json
 import time
 import asyncio
-
+from agent.events import AgentEvent, StreamHandler
 
 TASK_STATE_SYSTEM_PROMPT = """
 You are an autonomous coding agent operating inside a bounded workspace.
@@ -41,6 +41,7 @@ class ModelClient(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        on_stream: StreamHandler | None = None
     ) -> dict[str, Any]:
         """Generate the next model response."""
         ...
@@ -48,6 +49,7 @@ class ModelClient(Protocol):
 @dataclass
 class AgentResponse:
     content: str | None = None
+    reasoning: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     error: str | None = None
     usage: dict[str, int] | None = None
@@ -74,6 +76,7 @@ class AgentRuntime:
         self._cooldown_interval = 0.1  # seconds between tool calls
         self._last_tool_call_time = 0.0
         self._last_heartbeat = {}
+        self.stream_handler = None
 
     _FILE_MUTATING_TOOLS = {
         "write_file",
@@ -103,6 +106,16 @@ class AgentRuntime:
             state.files.append(path)
 
         self.server.state.save(state)
+
+    def set_stream_handler(
+        self,
+        handler: StreamHandler | None,
+    ) -> None:
+        self.stream_handler = handler
+
+    def _emit_event(self, event: AgentEvent) -> None:
+        if self.stream_handler is not None:
+            self.stream_handler(event)
 
     def create_chat_history(self) -> list[dict[str, Any]]:
         return [
@@ -170,6 +183,7 @@ class AgentRuntime:
             response = await self.model.generate(
                 messages=messages,
                 tools=tools,
+                on_stream=self.stream_handler
             )
 
             agent_response = (
@@ -264,6 +278,17 @@ class AgentRuntime:
             )
 
             for tool_call in tool_calls:
+                self._emit_event(
+                    AgentEvent(
+                        kind="tool_call",
+                        tool_name=tool_call["name"],
+                        tool_arguments=tool_call.get(
+                            "arguments",
+                            {},
+                        ),
+                    )
+                )
+
                 tool_result = (
                     await self._execute_tool(
                         tool_call
@@ -277,6 +302,29 @@ class AgentRuntime:
                         "structured_content",
                     )
                     else tool_result
+                )
+
+                is_error = (
+                    isinstance(content, dict)
+                    and content.get("is_error") is True
+                )
+
+                error_text = ""
+                if is_error:
+                    error_text = str(
+                        content.get(
+                            "error",
+                            "Tool execution failed.",
+                        )
+                    )
+
+                self._emit_event(
+                    AgentEvent(
+                        kind="tool_result",
+                        text=error_text,
+                        tool_name=tool_call["name"],
+                        is_error=is_error,
+                    )
                 )
 
                 messages.append(
@@ -311,6 +359,7 @@ class AgentRuntime:
         response = await self.model.generate(
             messages=messages,
             tools=[],
+            on_stream=self.stream_handler
         )
 
         agent_response = (
@@ -400,6 +449,7 @@ class AgentRuntime:
 
         message = choices[0].get("message", {})
         tool_calls = message.get("tool_calls", [])
+        reasoning = message.get("reasoning_content") or ""
 
         if tool_calls:
             parsed_tool_calls = []
@@ -422,12 +472,14 @@ class AgentRuntime:
                 })
 
             return AgentResponse(
+                reasoning=reasoning,
                 tool_calls=parsed_tool_calls,
                 usage=usage
             )
 
         return AgentResponse(
             content=message.get("content") or "",
+            reasoning=reasoning,
             usage=usage
         )
 

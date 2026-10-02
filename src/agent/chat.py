@@ -11,10 +11,175 @@ try:
 except ImportError:
     readline = None
 
+from agent.events import AgentEvent
 from agent.runtime import AgentRuntime
 
 if readline is not None:
     readline.set_history_length(1000)
+
+class TerminalStreamRenderer:
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    def __init__(self, output: TextIO):
+        self.output = output
+        self.mode: str | None = None
+
+    def handle(self, event: AgentEvent) -> None:
+        if event.kind == "reasoning":
+            if self.mode != "reasoning":
+                self._switch_to_reasoning()
+
+            print(
+                event.text,
+                end="",
+                file=self.output,
+                flush=True,
+            )
+            return
+
+        if event.kind == "content":
+            if self.mode != "content":
+                self._switch_to_content()
+
+            print(
+                event.text,
+                end="",
+                file=self.output,
+                flush=True,
+            )
+            return
+
+        if event.kind == "tool_call":
+            self._render_tool_call(event)
+            return
+
+        if event.kind == "tool_result":
+            self._render_tool_result(event)
+
+    def _render_tool_call(self, event: AgentEvent) -> None:
+        self._end_text_stream()
+
+        arguments = self._format_tool_arguments(
+            event.tool_arguments or {}
+        )
+        suffix = f" {arguments}" if arguments else ""
+
+        print(
+            f"[tool] {event.tool_name or '<unknown>'}{suffix}",
+            file=self.output,
+            flush=True,
+        )
+
+    def _render_tool_result(self, event: AgentEvent) -> None:
+        self._end_text_stream()
+
+        name = event.tool_name or "<unknown>"
+        if event.is_error:
+            detail = f": {event.text}" if event.text else ""
+            line = f"[tool] {name} ✗{detail}"
+        else:
+            line = f"[tool] {name} ✓"
+
+        print(
+            line,
+            file=self.output,
+            flush=True,
+        )
+
+    @staticmethod
+    def _compact_tool_value(value):
+        if isinstance(value, str):
+            if len(value) > 120:
+                return f"<{len(value)} chars>"
+            return value
+
+        if isinstance(value, dict):
+            return {
+                key: TerminalStreamRenderer._compact_tool_value(item)
+                for key, item in value.items()
+            }
+
+        if isinstance(value, list):
+            if len(value) > 8:
+                return [
+                    TerminalStreamRenderer._compact_tool_value(item)
+                    for item in value[:8]
+                ] + [f"<{len(value) - 8} more items>"]
+
+            return [
+                TerminalStreamRenderer._compact_tool_value(item)
+                for item in value
+            ]
+
+        return value
+
+    @classmethod
+    def _format_tool_arguments(
+        cls,
+        arguments: dict,
+    ) -> str:
+        if not arguments:
+            return ""
+
+        compact = cls._compact_tool_value(arguments)
+        return json.dumps(
+            compact,
+            ensure_ascii=False,
+            separators=(", ", ": "),
+        )
+
+    def _end_text_stream(self) -> None:
+        if self.mode == "reasoning":
+            print(
+                self.RESET,
+                end="",
+                file=self.output,
+                flush=True,
+            )
+
+        if self.mode in {"reasoning", "content"}:
+            print(
+                file=self.output,
+                flush=True,
+            )
+
+        self.mode = None
+
+    def _switch_to_reasoning(self) -> None:
+        if self.mode is not None:
+            print(
+                self.RESET,
+                file=self.output,
+                flush=True,
+            )
+
+        print(
+            f"\n{self.DIM}[thinking]\n",
+            end="",
+            file=self.output,
+            flush=True,
+        )
+
+        self.mode = "reasoning"
+
+    def _switch_to_content(self) -> None:
+        if self.mode == "reasoning":
+            print(
+                f"{self.RESET}\n",
+                file=self.output,
+                flush=True,
+            )
+        elif self.mode is None:
+            print(
+                file=self.output,
+                flush=True,
+            )
+
+        self.mode = "content"
+
+    def finish(self) -> None:
+        self._end_text_stream()
 
 class ChatSession:
     def __init__(
@@ -28,6 +193,8 @@ class ChatSession:
         self.input_fn = input_fn
         self.output = output or sys.stdout
         self.messages = runtime.create_chat_history()
+        self.renderer = TerminalStreamRenderer(self.output)
+        self.runtime.set_stream_handler(self.renderer.handle)
 
     async def run(self, initial_message: str | None = None) -> None:
         self._print_banner()
@@ -58,20 +225,26 @@ class ChatSession:
 
             await self._run_user_message(message)
 
-    async def _run_user_message(self, message: str) -> None:
+    async def _run_user_message(
+        self,
+        message: str,
+    ) -> None:
+        error: Exception | None = None
+
         try:
-            response = await self.runtime.run_chat_turn(
+            await self.runtime.run_chat_turn(
                 self.messages,
                 message,
             )
         except Exception as exc:
-            self._write(f"[error] {exc}")
-            return
+            error = exc
+        finally:
+            self.renderer.finish()
 
-        if response:
-            self._write()
-            self._write(response)
-            self._write(newline=False)
+        if error is not None:
+            self._write(
+                f"[error] {error}"
+            )
 
     def _handle_command(self, command: str) -> bool:
         command = command.lower()

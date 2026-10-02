@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import copy
 import io
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.chat import ChatSession
+from agent.chat import ChatSession, TerminalStreamRenderer
 from agent.cli import async_main, create_parser
 from agent.mcp_.agent_server import AgentServer
 from agent.runtime import AgentRuntime
+from agent.events import AgentEvent
 
 
 class SequenceModel:
@@ -26,6 +28,7 @@ class SequenceModel:
         self,
         messages,
         tools,
+        on_stream=None,
     ):
         self.calls.append(
             {
@@ -248,6 +251,14 @@ class FakeRuntime:
             list[dict]
         ] = []
 
+        self.stream_handler = None
+
+    def set_stream_handler(
+        self,
+        handler,
+    ) -> None:
+        self.stream_handler = handler
+
     def create_chat_history(
         self,
     ) -> list[dict]:
@@ -291,7 +302,7 @@ class FakeRuntime:
 @pytest.mark.anyio
 async def test_chat_session_keeps_history_between_inputs():
     runtime = FakeRuntime()
-    output = io.StringIO()
+    output = StringIO()
 
     inputs = iter(
         [
@@ -329,7 +340,7 @@ async def test_chat_session_keeps_history_between_inputs():
 @pytest.mark.anyio
 async def test_chat_clear_discards_conversation_history():
     runtime = FakeRuntime()
-    output = io.StringIO()
+    output = StringIO()
 
     inputs = iter(
         [
@@ -368,7 +379,7 @@ async def test_chat_clear_discards_conversation_history():
 @pytest.mark.anyio
 async def test_chat_help_and_state_commands_do_not_call_model():
     runtime = FakeRuntime()
-    output = io.StringIO()
+    output = StringIO()
 
     inputs = iter(
         [
@@ -491,3 +502,199 @@ async def test_cli_chat_path_awaits_chat_session(
         runtime,
         initial_message=None,
     )
+
+def test_renderer_separates_reasoning_and_content():
+    output = StringIO()
+
+    renderer = TerminalStreamRenderer(output)
+
+    renderer.handle(
+        AgentEvent(
+            kind="reasoning",
+            text="Thinking...",
+        )
+    )
+
+    renderer.handle(
+        AgentEvent(
+            kind="content",
+            text="Answer.",
+        )
+    )
+
+    renderer.finish()
+
+    rendered = output.getvalue()
+
+    assert "[thinking]" in rendered
+    assert "Thinking..." in rendered
+    assert "Answer." in rendered
+
+    assert renderer.DIM in rendered
+    assert renderer.RESET in rendered
+
+    assert rendered.index("Thinking...") < rendered.index(
+        "Answer."
+    )
+
+@pytest.mark.anyio
+async def test_chat_does_not_print_streamed_answer_twice():
+    output = StringIO()
+
+    class FakeServer:
+        class Workspace:
+            root = "/tmp/workspace"
+
+        workspace = Workspace()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.server = FakeServer()
+            self.stream_handler = None
+
+        def create_chat_history(self):
+            return [
+                {
+                    "role": "system",
+                    "content": "system",
+                }
+            ]
+
+        def set_stream_handler(self, handler):
+            self.stream_handler = handler
+
+        async def run_chat_turn(
+            self,
+            messages,
+            message,
+        ):
+            self.stream_handler(
+                AgentEvent(
+                    kind="content",
+                    text="Hello world",
+                )
+            )
+
+            return "Hello world"
+
+    session = ChatSession(
+        FakeRuntime(),
+        output=output,
+    )
+
+    await session._run_user_message("hello")
+
+    rendered = output.getvalue()
+
+    assert rendered.count("Hello world") == 1
+
+@pytest.mark.anyio
+async def test_chat_finishes_renderer_after_stream_error():
+    output = StringIO()
+
+    class FakeServer:
+        class Workspace:
+            root = "/tmp/workspace"
+
+        workspace = Workspace()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.server = FakeServer()
+            self.stream_handler = None
+
+        def create_chat_history(self):
+            return []
+
+        def set_stream_handler(self, handler):
+            self.stream_handler = handler
+
+        async def run_chat_turn(
+            self,
+            messages,
+            message,
+        ):
+            self.stream_handler(
+                AgentEvent(
+                    kind="reasoning",
+                    text="Thinking...",
+                )
+            )
+
+            raise RuntimeError("boom")
+
+    session = ChatSession(
+        FakeRuntime(),
+        output=output,
+    )
+
+    await session._run_user_message("hello")
+
+    rendered = output.getvalue()
+
+    assert "Thinking..." in rendered
+    assert "[error] boom" in rendered
+
+    # Thinking mode must always be reset even on failure.
+    assert session.renderer.RESET in rendered
+    assert session.renderer.mode is None
+
+
+def test_renderer_displays_tool_lifecycle_after_reasoning():
+    output = StringIO()
+    renderer = TerminalStreamRenderer(output)
+
+    renderer.handle(
+        AgentEvent(
+            kind="reasoning",
+            text="I should inspect the workspace.",
+        )
+    )
+    renderer.handle(
+        AgentEvent(
+            kind="tool_call",
+            tool_name="project_info",
+            tool_arguments={},
+        )
+    )
+    renderer.handle(
+        AgentEvent(
+            kind="tool_result",
+            tool_name="project_info",
+        )
+    )
+
+    rendered = output.getvalue()
+
+    assert "I should inspect the workspace." in rendered
+    assert "[tool] project_info" in rendered
+    assert "[tool] project_info ✓" in rendered
+    assert renderer.RESET in rendered
+    assert renderer.mode is None
+
+    assert rendered.index(renderer.RESET) < rendered.index(
+        "[tool] project_info"
+    )
+
+
+def test_renderer_compacts_large_tool_arguments():
+    output = StringIO()
+    renderer = TerminalStreamRenderer(output)
+
+    renderer.handle(
+        AgentEvent(
+            kind="tool_call",
+            tool_name="write_file",
+            tool_arguments={
+                "path": "example.txt",
+                "content": "x" * 500,
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+
+    assert '[tool] write_file' in rendered
+    assert '"path": "example.txt"' in rendered
+    assert '"content": "<500 chars>"' in rendered
+    assert "x" * 120 not in rendered

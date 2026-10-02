@@ -1,5 +1,6 @@
 import pytest
 import json
+from agent.events import AgentEvent
 from agent.mcp_.agent_server import AgentServer
 from agent.runtime import AgentRuntime
 
@@ -9,10 +10,11 @@ class FakeModel:
         self.response = response
         self.calls = []
 
-    async def generate(self, messages, tools):
+    async def generate(self, messages, tools, on_stream=None):
         self.calls.append({
             "messages": messages,
             "tools": tools,
+            "on_stream": on_stream
         })
         return self.response
 
@@ -37,16 +39,28 @@ async def test_runtime_initializes_task_state(tmp_path):
     assert state.status == "completed"
 
 class SequenceModel:
-    def __init__(self, responses):
-        self.responses = iter(responses)
+    def __init__(
+        self,
+        responses,
+    ):
+        self.responses = list(responses)
         self.calls = []
 
-    async def generate(self, messages, tools):
-        self.calls.append({
-            "messages": messages,
-            "tools": tools,
-        })
-        return next(self.responses)
+    async def generate(
+        self,
+        messages,
+        tools,
+        on_stream=None,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "on_stream": on_stream,
+            }
+        )
+
+        return self.responses.pop(0)
 
 
 @pytest.mark.anyio
@@ -689,7 +703,7 @@ class TaskStateModel:
     def __init__(self):
         self.calls = 0
 
-    async def generate(self, messages, tools):
+    async def generate(self, messages, tools, on_stream=None):
         self.calls += 1
 
         if self.calls == 1:
@@ -910,3 +924,177 @@ async def test_runtime_cooldown_between_tool_calls():
     if len(call_times) > 1:
         delta = call_times[1] - call_times[0]
         assert delta >= 0.05  # Cooldown interval is 0.1s, allow for async scheduling variance
+
+def test_runtime_parses_reasoning_content(tmp_path):
+    server = AgentServer(tmp_path)
+
+    runtime = AgentRuntime(
+        server=server,
+        model=None,
+    )
+
+    response = runtime._parse_response(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": (
+                            "I should inspect the project first."
+                        ),
+                        "content": (
+                            "The project looks correct."
+                        ),
+                    }
+                }
+            ]
+        }
+    )
+
+    assert (
+        response.reasoning
+        == "I should inspect the project first."
+    )
+
+    assert (
+        response.content
+        == "The project looks correct."
+    )
+
+@pytest.mark.anyio
+async def test_runtime_passes_stream_handler_to_model(
+    tmp_path,
+):
+    server = AgentServer(tmp_path)
+
+    received = []
+
+    class Model:
+        async def generate(
+            self,
+            messages,
+            tools,
+            on_stream=None,
+        ):
+            received.append(on_stream)
+
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                        }
+                    }
+                ]
+            }
+
+    runtime = AgentRuntime(
+        server=server,
+        model=Model(),
+    )
+
+    def handler(event):
+        pass
+
+    runtime.set_stream_handler(handler)
+
+    result = await runtime.run("test")
+
+    assert result == "done"
+    assert received == [handler]
+
+
+@pytest.mark.anyio
+async def test_runtime_emits_tool_lifecycle_events(tmp_path):
+    server = AgentServer(tmp_path)
+
+    model = SequenceModel([
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_project_info",
+                        "type": "function",
+                        "function": {
+                            "name": "project_info",
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            "content": "Done.",
+        },
+    ])
+
+    events = []
+    runtime = AgentRuntime(server, model)
+    runtime.set_stream_handler(events.append)
+
+    result = await runtime.run("Inspect the workspace")
+
+    assert result == "Done."
+    assert events == [
+        AgentEvent(
+            kind="tool_call",
+            tool_name="project_info",
+            tool_arguments={},
+        ),
+        AgentEvent(
+            kind="tool_result",
+            tool_name="project_info",
+            is_error=False,
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_runtime_emits_failed_tool_result_event(tmp_path):
+    server = AgentServer(tmp_path)
+
+    model = SequenceModel([
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_read_file",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({
+                                "path": "does-not-exist.txt",
+                            }),
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            "content": "The file does not exist.",
+        },
+    ])
+
+    events = []
+    runtime = AgentRuntime(server, model)
+    runtime.set_stream_handler(events.append)
+
+    await runtime.run("Read the missing file")
+
+    assert events[0] == AgentEvent(
+        kind="tool_call",
+        tool_name="read_file",
+        tool_arguments={
+            "path": "does-not-exist.txt",
+        },
+    )
+
+    assert events[1].kind == "tool_result"
+    assert events[1].tool_name == "read_file"
+    assert events[1].is_error is True
+    assert events[1].text

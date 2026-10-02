@@ -1,8 +1,10 @@
+import json
+
 import httpx
 import pytest
-import json
-from agent.model import GenerationConfig, LlamaCppClient
 
+from agent.events import AgentEvent
+from agent.model import GenerationConfig, LlamaCppClient
 
 @pytest.mark.anyio
 async def test_llama_cpp_client_generates_response():
@@ -13,14 +15,12 @@ async def test_llama_cpp_client_generates_response():
 
         return httpx.Response(
             200,
-            json={
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "Hello",
-                    }
-                }]
-            },
+            text=(
+                'data: {"choices":[{"delta":'
+                '{"content":"Hello"},'
+                '"finish_reason":"stop"}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
         )
 
     transport = httpx.MockTransport(handler)
@@ -104,7 +104,10 @@ async def test_llama_cpp_client_raises_on_invalid_json():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            content=b"this is not json",
+            text=(
+                "data: this is not json\n\n"
+                "data: [DONE]\n\n"
+            )
         )
 
     transport = httpx.MockTransport(handler)
@@ -152,41 +155,41 @@ async def test_llama_cpp_client_normalizes_base_url():
 
 
 @pytest.mark.anyio
-async def test_llama_cpp_client_disables_streaming():
+async def test_llama_cpp_client_enables_streaming():
     requests = []
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(
+        request: httpx.Request,
+    ) -> httpx.Response:
         requests.append(request)
 
         return httpx.Response(
             200,
-            json={
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "Hello",
-                    }
-                }]
-            },
+            text="data: [DONE]\n\n",
         )
 
     client = LlamaCppClient(
         base_url="http://localhost:8080",
         model="test-model",
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(
+            handler
+        ),
     )
 
     await client.generate(
-        messages=[{
-            "role": "user",
-            "content": "Hello",
-        }],
+        messages=[],
         tools=[],
     )
 
-    body = json.loads(requests[0].content)
+    body = json.loads(
+        requests[0].content
+    )
 
-    assert body["stream"] is False
+    assert body["stream"] is True
+
+    assert body["stream_options"] == {
+        "include_usage": True,
+    }
 
 
 @pytest.mark.anyio
@@ -344,3 +347,246 @@ async def test_llama_cpp_client_configures_timeout():
     assert client.timeout.read is None
     assert client.timeout.write == 30.0
     assert client.timeout.pool == 10.0
+
+@pytest.mark.anyio
+async def test_model_streams_content():
+    events = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+
+        assert payload["stream"] is True
+
+        body = "\n\n".join(
+            [
+                'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+                'data: {"choices":[{"delta":{"content":"lo"},'
+                '"finish_reason":"stop"}]}',
+                (
+                    'data: {"choices":[],"usage":{'
+                    '"prompt_tokens":10,'
+                    '"completion_tokens":2,'
+                    '"total_tokens":12}}'
+                ),
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        return httpx.Response(
+            200,
+            text=body,
+        )
+
+    client = LlamaCppClient(
+        base_url="http://test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await client.generate(
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        tools=[],
+        on_stream=events.append,
+    )
+
+    assert events == [
+        AgentEvent(
+            kind="content",
+            text="Hel",
+        ),
+        AgentEvent(
+            kind="content",
+            text="lo",
+        ),
+    ]
+
+    message = response["choices"][0]["message"]
+
+    assert message["content"] == "Hello"
+    assert response["choices"][0]["finish_reason"] == "stop"
+    assert response["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+
+@pytest.mark.anyio
+async def test_model_streams_reasoning_separately():
+    events = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = "\n\n".join(
+            [
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"reasoning_content":"I should "}}]}'
+                ),
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"reasoning_content":"inspect this."}}]}'
+                ),
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"content":"The answer "}}]}'
+                ),
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"content":"is 42."},'
+                    '"finish_reason":"stop"}]}'
+                ),
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        return httpx.Response(
+            200,
+            text=body,
+        )
+
+    client = LlamaCppClient(
+        base_url="http://test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await client.generate(
+        messages=[],
+        tools=[],
+        on_stream=events.append,
+    )
+
+    assert events == [
+        AgentEvent(
+            kind="reasoning",
+            text="I should ",
+        ),
+        AgentEvent(
+            kind="reasoning",
+            text="inspect this.",
+        ),
+        AgentEvent(
+            kind="content",
+            text="The answer ",
+        ),
+        AgentEvent(
+            kind="content",
+            text="is 42.",
+        ),
+    ]
+
+    message = response["choices"][0]["message"]
+
+    assert (
+        message["reasoning_content"]
+        == "I should inspect this."
+    )
+
+    assert message["content"] == "The answer is 42."
+
+@pytest.mark.anyio
+async def test_model_accumulates_streamed_tool_call_fragments():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = "\n\n".join(
+            [
+                (
+                    'data: {"choices":[{"delta":{"tool_calls":['
+                    '{"index":0,"id":"call_","type":"function",'
+                    '"function":{"name":"read_",'
+                    '"arguments":"{\\"path\\":"}}]}}]}'
+                ),
+                (
+                    'data: {"choices":[{"delta":{"tool_calls":['
+                    '{"index":0,"id":"123",'
+                    '"function":{"name":"file",'
+                    '"arguments":"\\"README.md\\"}"}}]},'
+                    '"finish_reason":"tool_calls"}]}'
+                ),
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        return httpx.Response(
+            200,
+            text=body,
+        )
+
+    client = LlamaCppClient(
+        base_url="http://test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await client.generate(
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {},
+                },
+            }
+        ],
+    )
+
+    choice = response["choices"][0]
+    tool_call = choice["message"]["tool_calls"][0]
+
+    assert choice["finish_reason"] == "tool_calls"
+
+    assert tool_call == {
+        "id": "123",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        },
+    }
+
+@pytest.mark.anyio
+async def test_model_streaming_does_not_require_handler():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = "\n\n".join(
+            [
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"content":"Hello"}}]}'
+                ),
+                (
+                    'data: {"choices":[{"delta":{'
+                    '"content":" world"},'
+                    '"finish_reason":"stop"}]}'
+                ),
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        return httpx.Response(
+            200,
+            text=body,
+        )
+
+    client = LlamaCppClient(
+        base_url="http://test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = await client.generate(
+        messages=[],
+        tools=[],
+    )
+
+    assert (
+        response["choices"][0]["message"]["content"]
+        == "Hello world"
+    )
