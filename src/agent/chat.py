@@ -18,6 +18,8 @@ if readline is not None:
     readline.set_history_length(1000)
 
 class TerminalStreamRenderer:
+    MAGENTA = "\033[35m"
+    GREEN = "\033[32m"
     DIM = "\033[2m"
     RESET = "\033[0m"
 
@@ -196,6 +198,15 @@ class ChatSession:
         self.renderer = TerminalStreamRenderer(self.output)
         self.runtime.set_stream_handler(self.renderer.handle)
 
+    def _input_prompt(self) -> str:
+        if readline is not None:
+            return (
+                f"\001\n{self.renderer.MAGENTA}\002"
+                ">>>"
+                f"\001{self.renderer.GREEN}\002 "
+            )
+        return f"\n{self.renderer.MAGENTA}>>>{self.renderer.GREEN}"
+
     async def run(self, initial_message: str | None = None) -> None:
         self._print_banner()
 
@@ -206,11 +217,18 @@ class ChatSession:
             try:
                 raw = await asyncio.to_thread(
                     self.input_fn,
-                    ">>> ",
+                    self._input_prompt(),
                 )
             except EOFError:
                 self._write()
                 return
+            finally:
+                print(
+                    self.renderer.RESET,
+                    end="",
+                    file=self.output,
+                    flush=True
+                )
 
             message = raw.strip()
 
@@ -299,7 +317,11 @@ class ChatSession:
         return False
 
     def _print_banner(self) -> None:
-        self._write("Local Agent")
+        context = getattr(self.runtime.server, "context", None)
+        identity = getattr(context, "identity", None)
+        name = getattr(identity, "name", "Local Agent")
+
+        self._write(name)
         self._write(
             f"Workspace: "
             f"{self.runtime.server.workspace.root}"

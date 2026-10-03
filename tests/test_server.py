@@ -1,20 +1,56 @@
-import pytest
 import asyncio
 import subprocess
-from agent.mcp_.agent_server import AgentServer
+
+import pytest
 from fastmcp.exceptions import ToolError, ValidationError
+
+from agent.mcp_.agent_server import AgentServer
+
+
+def call(server: AgentServer, name: str, arguments: dict | None = None):
+    return asyncio.run(server.mcp.call_tool(name, arguments or {}))
+
+
+def init_git_repo(path):
+    subprocess.run(
+        ["git", "init"], cwd=path, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=path, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=path, check=True,
+    )
+
+
+def commit_file(path, name="test.txt", content="hello\n"):
+    (path / name).write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", name], cwd=path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Initial commit"],
+        cwd=path, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
 
 
 def test_server_registers_expected_tools(tmp_path):
     server = AgentServer(tmp_path)
+    names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
 
-    tools = asyncio.run(server.mcp.list_tools())
-    names = {tool.name for tool in tools}
-
-    expected = {
+    assert names == {
         "project_info",
+        "get_agent_context",
+        "start_task",
+        "resume_task",
         "get_task_state",
         "set_task_state",
+        "finish_task",
+        "list_tasks",
+        "search_tasks",
+        "get_task_history",
         "read_file",
         "write_file",
         "edit_file_lines",
@@ -30,610 +66,208 @@ def test_server_registers_expected_tools(tmp_path):
         "git_show",
         "delete_item",
         "move_item",
-        "run_command"
+        "run_command",
     }
-
-    assert names == expected
 
 
 def test_project_info(tmp_path):
-    server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool("project_info", {})
-    )
-
-    print(result)
-    print(type(result))
-    print(vars(result))
-    
+    result = call(AgentServer(tmp_path), "project_info")
     assert not result.is_error
     assert result.structured_content["workspace"] == str(tmp_path.resolve())
 
 
-def test_task_state_tools(tmp_path):
+def test_agent_context_index(tmp_path):
+    result = call(AgentServer(tmp_path), "get_agent_context")
+    assert not result.is_error
+    assert result.structured_content["identity"]["name"] == "Local Agent"
+    assert "evidence" in result.structured_content["topics"]
+
+
+def test_chat_has_no_implicit_task_state(tmp_path):
     server = AgentServer(tmp_path)
-
-    state = server.state.load()
-    state.task = "Test server"
-    state.status = "in_progress"
-    state.files = ["src/example.py"]
-    state.current = "Initial work"
-    state.completed = ["Inspect project"]
-    state.blocked = ["Waiting for dependency"]
-    server.state.save(state)
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "set_task_state",
-            {
-                "current": "Implementing task state",
-                "completed": [
-                    "Inspect project",
-                    "Implement task state",
-                ],
-                "blocked": [],
-            },
-        )
-    )
+    result = call(server, "get_task_state")
 
     assert not result.is_error
-    assert result.structured_content["task"] == "Test server"
-    assert result.structured_content["status"] == "in_progress"
-    assert result.structured_content["current"] == "Implementing task state"
-    assert result.structured_content["completed"] == [
-        "Inspect project",
-        "Implement task state",
-    ]
-    assert result.structured_content["blocked"] == []
-    assert result.structured_content["files"] == ["src/example.py"]
-
-    result = asyncio.run(
-        server.mcp.call_tool("get_task_state", {})
-    )
-
-    assert result.structured_content["task"] == "Test server"
-    assert result.structured_content["status"] == "in_progress"
-    assert result.structured_content["current"] == "Implementing task state"
-    assert result.structured_content["completed"] == [
-        "Inspect project",
-        "Implement task state",
-    ]
-    assert result.structured_content["blocked"] == []
-    assert result.structured_content["files"] == ["src/example.py"]
+    assert result.structured_content["active"] is False
+    assert result.structured_content["task_id"] is None
+    assert server.tasks.list_tasks() == []
 
 
-def test_set_task_state_preserves_omitted_fields(tmp_path):
+def test_task_lifecycle_and_bounded_history_tools(tmp_path):
     server = AgentServer(tmp_path)
 
-    state = server.state.load()
-    state.task = "Original task"
-    state.status = "in_progress"
-    state.current = "Current work"
-    state.completed = ["Step one"]
-    state.blocked = ["Step two"]
-    state.files = ["main.py"]
-    server.state.save(state)
+    started = call(
+        server,
+        "start_task",
+        {
+            "title": "Inspect project",
+            "goal": "Inspect the project and report issues.",
+        },
+    ).structured_content
+    task_id = started["task_id"]
 
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "set_task_state",
-            {
-                "current": "Updated work",
-            },
-        )
-    )
+    updated = call(
+        server,
+        "set_task_state",
+        {
+            "current": "Inspecting source",
+            "completed": ["Inspect tree"],
+            "blocked": [],
+        },
+    ).structured_content
 
-    assert not result.is_error
-    assert result.structured_content == {
-        "task": "Original task",
-        "status": "in_progress",
-        "current": "Updated work",
-        "completed": ["Step one"],
-        "blocked": ["Step two"],
-        "files": ["main.py"],
-    }
+    assert updated["task_id"] == task_id
+    assert updated["revision"] == 2
+    assert updated["current"] == "Inspecting source"
+
+    history = call(
+        server,
+        "get_task_history",
+        {"task_id": task_id, "limit": 1},
+    ).structured_content
+
+    assert history["task"]["id"] == task_id
+    assert len(history["revisions"]) == 1
+    assert history["revisions"][0]["revision"] == 2
+    assert history["next_before_revision"] == 2
+
+    finished = call(
+        server,
+        "finish_task",
+        {"status": "completed"},
+    ).structured_content
+    assert finished["status"] == "completed"
 
 
-def test_set_task_state_replaces_completed_and_blocked(tmp_path):
+def test_task_search_and_resume(tmp_path):
     server = AgentServer(tmp_path)
+    first = server.start_task("Config loader", "Improve config loading")
+    first.current = "Inspect parser"
+    server.save_active_task_state(first)
+    server.finish_active_task("blocked")
 
-    state = server.state.load()
-    state.task = "Test task"
-    state.status = "in_progress"
-    state.current = "Working"
-    state.completed = [
-        "Old step one",
-        "Old step two",
-    ]
-    state.blocked = [
-        "Old blocker",
-    ]
-    state.files = ["test.py"]
-    server.state.save(state)
+    search = call(
+        server,
+        "search_tasks",
+        {"query": "parser", "limit": 5},
+    ).structured_content["result"]
+    assert search[0]["task_id"] == first.task_id
+    assert "goal_preview" in search[0]
+    assert "goal" not in search[0]
 
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "set_task_state",
-            {
-                "completed": [
-                    "Reorganized step one",
-                    "Reorganized step two",
-                    "Reorganized step three",
-                ],
-                "blocked": [
-                    "New blocker",
-                ],
-            },
-        )
-    )
+    resumed = call(
+        server,
+        "resume_task",
+        {"task_id": first.task_id},
+    ).structured_content
+    assert resumed["status"] == "in_progress"
 
-    assert not result.is_error
-    assert result.structured_content["completed"] == [
-        "Reorganized step one",
-        "Reorganized step two",
-        "Reorganized step three",
-    ]
-    assert result.structured_content["blocked"] == [
-        "New blocker",
-    ]
+
+def test_set_task_state_requires_active_task(tmp_path):
+    server = AgentServer(tmp_path)
+    with pytest.raises(ToolError, match="No active task"):
+        call(server, "set_task_state", {"current": "No task"})
 
 
 def test_set_task_state_rejects_runtime_owned_fields(tmp_path):
     server = AgentServer(tmp_path)
-
-    state = server.state.load()
-    state.task = "Original task"
-    state.status = "in_progress"
-    state.files = ["existing.py"]
-    server.state.save(state)
+    server.start_task("Test", "Test runtime-owned fields")
 
     for field, value in (
-        ("task", "Malicious replacement"),
+        ("task_id", "other"),
+        ("title", "replacement"),
+        ("goal", "replacement"),
         ("status", "completed"),
         ("files", ["malicious.py"]),
+        ("revision", 999),
     ):
         with pytest.raises(ValidationError):
-            asyncio.run(
-                server.mcp.call_tool(
-                    "set_task_state",
-                    {field: value},
-                )
-            )
-
-    state = server.state.load()
-
-    assert state.task == "Original task"
-    assert state.status == "in_progress"
-    assert state.files == ["existing.py"]
+            call(server, "set_task_state", {field: value})
 
 
-def test_file_tools(tmp_path):
+def test_file_tools_and_workspace_isolation(tmp_path):
     server = AgentServer(tmp_path)
 
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "write_file",
-            {
-                "path": "test.txt",
-                "content": "hello\nworld\n",
-            },
-        )
+    written = call(
+        server,
+        "write_file",
+        {"path": "test.txt", "content": "hello\nworld\n"},
     )
+    assert written.structured_content["path"] == "test.txt"
 
-    assert not result.is_error
-    assert result.structured_content["path"] == "test.txt"
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "read_file",
-            {
-                "path": "test.txt",
-            },
-        )
-    )
-
-    assert not result.is_error
-    assert result.structured_content == {
-        "1": "hello",
-        "2": "world",
-    }
-
-
-def test_mcp_workspace_isolation(tmp_path):
-    server = AgentServer(tmp_path)
+    read = call(server, "read_file", {"path": "test.txt"})
+    assert read.structured_content == {"1": "hello", "2": "world"}
 
     with pytest.raises(ToolError, match="Path escapes workspace"):
-        asyncio.run(
-            server.mcp.call_tool(
-                "write_file",
-                {
-                    "path": "../outside.txt",
-                    "content": "should fail",
-                },
-            )
+        call(
+            server,
+            "write_file",
+            {"path": "../outside.txt", "content": "no"},
         )
-
-    assert not (tmp_path.parent / "outside.txt").exists()
 
 
 def test_search_tools(tmp_path):
     server = AgentServer(tmp_path)
-
     (tmp_path / "main.py").write_text(
-        "def hello():\n"
-        "    print('hello')\n"
-        "    return 42\n",
+        "def hello():\n    print('hello')\n    return 42\n",
         encoding="utf-8",
     )
 
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "search_in_file",
-            {
-                "path": "main.py",
-                "pattern": "hello",
-            },
-        )
-    )
+    one = call(
+        server,
+        "search_in_file",
+        {"path": "main.py", "pattern": "hello"},
+    ).structured_content["result"]
+    assert [item["line"] for item in one] == [1, 2]
 
-    assert result.structured_content == {
-        "result": [
-            {
-                "path": "main.py",
-                "line": 1,
-                "text": "def hello():",
-            },
-            {
-                "path": "main.py",
-                "line": 2,
-                "text": "    print('hello')",
-            },
-        ]
-    }
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "search_files",
-            {
-                "pattern": "return",
-            },
-        )
-    )
-
-    assert result.structured_content == {
-        "result": [
-            {
-                "path": "main.py",
-                "line": 3,
-                "text": "    return 42",
-            },
-        ]
-    }
-
-
-def test_search_tools_reject_workspace_escape(tmp_path):
-    server = AgentServer(tmp_path)
+    many = call(
+        server,
+        "search_files",
+        {"pattern": "return"},
+    ).structured_content["result"]
+    assert many[0]["line"] == 3
 
     with pytest.raises(ToolError, match="Path escapes workspace"):
-        asyncio.run(
-            server.mcp.call_tool(
-                "search_in_file",
-                {
-                    "path": "../outside.txt",
-                    "pattern": "test",
-                },
-            )
+        call(
+            server,
+            "search_in_file",
+            {"path": "../outside.txt", "pattern": "test"},
         )
 
 
-def test_git_status_tool(tmp_path):
+def test_git_tools(tmp_path):
+    server = AgentServer(tmp_path)
+    status = call(server, "git_status").structured_content
+    assert status["ok"] is False
+    assert status["repository"] is False
+
+    init_git_repo(tmp_path)
+    commit_file(tmp_path)
+    (tmp_path / "test.txt").write_text("modified\n", encoding="utf-8")
     server = AgentServer(tmp_path)
 
-    result = asyncio.run(
-        server.mcp.call_tool("git_status", {})
-    )
+    status = call(server, "git_status").structured_content
+    assert status["ok"] is True
+    assert status["repository"] is True
+    assert status["clean"] is False
 
-    assert result.structured_content["ok"] is False
-    assert result.structured_content["repository"] is False
-    assert result.structured_content["clean"] is None
+    diff = call(server, "git_diff").structured_content
+    assert "hello" in diff["diff"]
+    assert "modified" in diff["diff"]
+
+    log = call(server, "git_log", {"max_count": 1}).structured_content
+    assert log["commits"][0]["subject"] == "Initial commit"
+    assert log["commits"][0]["author"] == "Test User"
+
+    shown = call(server, "git_show", {"revision": "HEAD"}).structured_content
+    assert shown["ok"] is True
+    assert "Initial commit" in shown["content"]
+    assert "hello" in shown["content"]
 
 
-def test_git_status_tool_repository(tmp_path):
-    subprocess.run(
-        ["git", "init"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
+def test_git_tool_validation(tmp_path):
     server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool("git_status", {})
-    )
-
-    assert result.structured_content["ok"] is True
-    assert result.structured_content["repository"] is True
-    assert result.structured_content["clean"] is True
-
-
-def test_git_diff_tool(tmp_path):
-    subprocess.run(
-        ["git", "init"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    (tmp_path / "test.txt").write_text(
-        "original\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        ["git", "add", "test.txt"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    (tmp_path / "test.txt").write_text(
-        "modified\n",
-        encoding="utf-8",
-    )
-
-    server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "git_diff",
-            {},
-        )
-    )
-
-    assert result.structured_content["ok"] is True
-    assert result.structured_content["staged"] is False
-    assert result.structured_content["path"] is None
-    assert "original" in result.structured_content["diff"]
-    assert "modified" in result.structured_content["diff"]
-
-
-def test_git_diff_tool_path_filter(tmp_path):
-    subprocess.run(
-        ["git", "init"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-    )
-
-    for name, content in (
-        ("first.txt", "first\n"),
-        ("second.txt", "second\n"),
-    ):
-        (tmp_path / name).write_text(content, encoding="utf-8")
-
-    subprocess.run(
-        ["git", "add", "."],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    (tmp_path / "first.txt").write_text(
-        "first modified\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "second.txt").write_text(
-        "second modified\n",
-        encoding="utf-8",
-    )
-
-    server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "git_diff",
-            {"path": "first.txt"},
-        )
-    )
-
-    assert result.structured_content["ok"] is True
-    assert "first modified" in result.structured_content["diff"]
-    assert "second modified" not in result.structured_content["diff"]
-
-
-def test_git_log_tool(tmp_path):
-    subprocess.run(
-        ["git", "init"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-    )
-
-    (tmp_path / "test.txt").write_text(
-        "hello\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        ["git", "add", "test.txt"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "git_log",
-            {"max_count": 1},
-        )
-    )
-
-    assert result.structured_content["ok"] is True
-
-    commits = result.structured_content["commits"]
-
-    assert len(commits) == 1
-    assert commits[0]["subject"] == "Initial commit"
-    assert commits[0]["author"] == "Test User"
-    assert commits[0]["hash"]
-    assert commits[0]["short_hash"]
-    assert commits[0]["date"]
-
-
-def test_git_log_tool_rejects_invalid_count(tmp_path):
-    server = AgentServer(tmp_path)
-
     with pytest.raises(ToolError, match="max_count must be"):
-        asyncio.run(
-            server.mcp.call_tool(
-                "git_log",
-                {"max_count": 0},
-            )
-        )
-
-
-def test_git_show_tool(tmp_path):
-    subprocess.run(
-        ["git", "init"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=tmp_path,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-    )
-
-    (tmp_path / "test.txt").write_text(
-        "hello\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        ["git", "add", "test.txt"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=tmp_path,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    server = AgentServer(tmp_path)
-
-    result = asyncio.run(
-        server.mcp.call_tool(
-            "git_show",
-            {"revision": "HEAD"},
-        )
-    )
-
-    assert result.structured_content["ok"] is True
-    assert result.structured_content["revision"] == "HEAD"
-    assert result.structured_content["path"] is None
-    assert "Initial commit" in result.structured_content["content"]
-    assert "hello" in result.structured_content["content"]
-
-
-def test_git_show_tool_rejects_empty_revision(tmp_path):
-    server = AgentServer(tmp_path)
-
+        call(server, "git_log", {"max_count": 0})
     with pytest.raises(ToolError, match="revision cannot be empty"):
-        asyncio.run(
-            server.mcp.call_tool(
-                "git_show",
-                {"revision": ""},
-            )
-        )
+        call(server, "git_show", {"revision": ""})

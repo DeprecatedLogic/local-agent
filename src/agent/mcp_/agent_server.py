@@ -4,17 +4,31 @@ from fastmcp import FastMCP
 from agent.mcp_.filesystem import Filesystem
 from agent.mcp_.search import Search
 from agent.mcp_.workspace import Workspace
-from agent.state import StateStore
+from agent.context import AgentContextStore
+from agent.state import ActiveTaskStateStore, TaskState, TaskStatus, TaskStore
 from agent.mcp_.git import Git
 from agent.command import CommandExecutor
+from typing import Literal
 
 
 class AgentServer:
-    def __init__(self, workspace_path: str):
+    def __init__(
+        self,
+        workspace_path: str,
+        *,
+        config_dir: str | None = None,
+    ):
         self.workspace = Workspace(workspace_path)
+        self.context = AgentContextStore(config_dir)
+        self.tasks = TaskStore(
+            self.workspace.resolve(".agent/task_history.db")
+        )
+        self.active_task_id: str | None = None
 
-        self.state = StateStore(
-            self.workspace.resolve(".agent/state.json")
+        # Transitional compatibility for code/tests that still access server.state.
+        self.state = ActiveTaskStateStore(
+            self.tasks,
+            lambda: self.active_task_id,
         )
 
         self.filesystem = Filesystem(self.workspace)
@@ -24,6 +38,62 @@ class AgentServer:
         self.mcp = FastMCP("local-agent")
 
         self._register_tools()
+
+    def start_task(self, title: str, goal: str) -> TaskState:
+        if self.active_task_id is not None:
+            active = self.tasks.get_state(self.active_task_id)
+            if active.status == "in_progress":
+                raise RuntimeError(
+                    "A task is already active. Finish or cancel it before "
+                    "starting another task."
+                )
+
+        state = self.tasks.create_task(title, goal)
+        self.active_task_id = state.task_id
+        return state
+
+    def resume_task(self, task_id: str) -> TaskState:
+        if self.active_task_id is not None:
+            active = self.tasks.get_state(self.active_task_id)
+            if active.status == "in_progress" and active.task_id != task_id:
+                raise RuntimeError(
+                    "A different task is already active. Finish or cancel it first."
+                )
+
+        state = self.tasks.get_state(task_id)
+        if state.status in {"completed", "cancelled"}:
+            raise RuntimeError(
+                f"Task {task_id} is {state.status} and cannot be resumed."
+            )
+        if state.status == "blocked":
+            state.status = "in_progress"
+            state = self.tasks.save_state(state)
+
+        self.active_task_id = task_id
+        return state
+
+    def get_active_task_state(self) -> TaskState:
+        if self.active_task_id is None:
+            return TaskState()
+        return self.tasks.get_state(self.active_task_id)
+
+    def save_active_task_state(self, state: TaskState) -> TaskState:
+        if self.active_task_id is None:
+            raise RuntimeError("No active task.")
+        if state.task_id != self.active_task_id:
+            raise RuntimeError("Task state does not belong to the active task.")
+        return self.tasks.save_state(state)
+
+    def finish_active_task(
+        self,
+        status: Literal["completed", "blocked", "cancelled"] = "completed",
+    ) -> TaskState:
+        if self.active_task_id is None:
+            raise RuntimeError("No active task.")
+
+        state = self.tasks.get_state(self.active_task_id)
+        state.status = status
+        return self.tasks.save_state(state)
 
     def _register_tools(self) -> None:
 
@@ -46,24 +116,43 @@ class AgentServer:
             }
 
         @self.mcp.tool()
-        def get_task_state() -> dict:
+        def get_agent_context(topic: str | None = None) -> dict:
             """
-            Return the persistent state of the current agent task.
+            Return agent identity information or one lazily loaded guidance topic.
 
-            Returns:
-                A dictionary containing the current task state, including:
-                - task: description of the overall task.
-                - status: current task status.
-                - current: description of the work currently being performed.
-                - completed: completed task items.
-                - blocked: blocked task items and reasons.
-                - files: files relevant to the task.
-
-            Notes:
-                Task state is persistent and stored inside the project workspace.
-                This operation is read-only.
+            Call with no topic to retrieve agent identity and list the available topics.
+            Retrieve a specific topic only when its detailed guidance is relevant to the current work.
             """
-            return self.state.load().to_dict()
+            return self.context.get(topic)
+
+        @self.mcp.tool()
+        def start_task(title: str, goal: str) -> dict:
+            """
+            Start persistent tracking for substantive work.
+
+            Do not use this for greetings, casual conversation, or trivial factual
+            questions. Use it when the work benefits from progress history or later
+            resumption. Only one task may be active in this agent session at a time.
+            """
+            return self.start_task(title, goal).to_dict()
+
+        @self.mcp.tool()
+        def resume_task(task_id: str) -> dict:
+            """Resume an unfinished persistent task by its stable task ID."""
+            return self.resume_task(task_id).to_dict()
+
+        @self.mcp.tool()
+        def get_task_state(task_id: str | None = None) -> dict:
+            """
+            Return a task's latest state.
+
+            If task_id is omitted, return the active task state. When no task is
+            active, the result has active=false rather than inventing a task from the
+            current chat message.
+            """
+            if task_id is None:
+                return self.get_active_task_state().to_dict()
+            return self.tasks.get_state(task_id).to_dict()
 
         @self.mcp.tool()
         def set_task_state(
@@ -72,58 +161,96 @@ class AgentServer:
             blocked: list[str] | None = None,
         ) -> dict:
             """
-            Update the model-managed fields of the persistent agent task state.
+            Update model-managed progress fields for the active persistent task.
 
-            Args:
-                current:
-                    Optional description of the work currently being performed.
-                    If omitted, the existing value is preserved.
-                    An empty string clears the current work description.
-
-                completed:
-                    Optional complete list of task items the model considers
-                    completed.
-                    If omitted, the existing list is preserved.
-                    If provided, the existing list is replaced entirely.
-                    An empty list clears the completed items.
-
-                blocked:
-                    Optional complete list of task items or reasons the model
-                    currently considers blocked.
-                    If omitted, the existing list is preserved.
-                    If provided, the existing list is replaced entirely.
-                    An empty list clears the blocked items.
-
-            Returns:
-                The complete updated task state.
-
-            Notes:
-                The model may reorganize its understanding of task progress.
-                Therefore completed and blocked are replacement-based rather than
-                append-only.
-
-                The following fields are runtime-owned and cannot be changed by
-                this operation:
-                - task: overall task description supplied by the user.
-                - status: runtime-controlled task lifecycle status.
-                - files: files modified or created by the runtime.
-
-                This operation modifies persistent task state.
+            completed and blocked are replacement-based lists. Task ID, title, goal,
+            status, revision metadata, and modified files are runtime-owned.
             """
-            state = self.state.load()
+            state = self.get_active_task_state()
+            if not state.active:
+                raise RuntimeError(
+                    "No active task. Call start_task only if this work warrants "
+                    "persistent task tracking."
+                )
 
             if current is not None:
                 state.current = current
-
             if completed is not None:
                 state.completed = completed
-
             if blocked is not None:
                 state.blocked = blocked
 
-            self.state.save(state)
+            return self.save_active_task_state(state).to_dict()
 
-            return state.to_dict()
+        @self.mcp.tool()
+        def finish_task(
+            status: Literal["completed", "blocked", "cancelled"] = "completed",
+        ) -> dict:
+            """Finish the active persistent task with an explicit lifecycle status."""
+            return self.finish_active_task(status).to_dict()
+
+        @self.mcp.tool()
+        def list_tasks(
+            limit: int = 10,
+            status: TaskStatus | None = None,
+            before: str | None = None,
+        ) -> list[dict]:
+            """
+            List bounded task summaries, newest first.
+
+            Use before with the oldest returned updated_at timestamp to paginate
+            without loading the entire history.
+            """
+            return self.tasks.list_tasks(
+                limit=limit,
+                status=status,
+                before=before,
+            )
+
+        @self.mcp.tool()
+        def search_tasks(query: str, limit: int = 10) -> list[dict]:
+            """Search task titles, goals, and latest current-work text."""
+            return self.tasks.search_tasks(query, limit=limit)
+
+        @self.mcp.tool()
+        def get_task_history(
+            task_id: str,
+            limit: int = 5,
+            before_revision: int | None = None,
+        ) -> dict:
+            """
+            Return a compact, bounded page of task-state revisions, newest first.
+
+            Task metadata is returned once rather than repeated in every revision.
+            Use next_before_revision to request an older page only when needed.
+            """
+            task = self.tasks.get_task(task_id)
+            states = self.tasks.get_history(
+                task_id,
+                limit=limit,
+                before_revision=before_revision,
+            )
+            revisions = [
+                {
+                    "revision": state.revision,
+                    "saved_at": state.saved_at,
+                    "status": state.status,
+                    "current": state.current,
+                    "completed": state.completed,
+                    "blocked": state.blocked,
+                    "files": state.files,
+                }
+                for state in states
+            ]
+            next_before_revision = None
+            if len(states) == limit and states[-1].revision > 1:
+                next_before_revision = states[-1].revision
+
+            return {
+                "task": task.to_dict(),
+                "revisions": revisions,
+                "next_before_revision": next_before_revision,
+            }
 
         @self.mcp.tool()
         def read_file(

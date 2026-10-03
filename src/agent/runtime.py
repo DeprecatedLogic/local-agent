@@ -7,34 +7,9 @@ import json
 import time
 import asyncio
 from agent.events import AgentEvent, StreamHandler
+from agent.context import build_system_prompt
 
-TASK_STATE_SYSTEM_PROMPT = """
-You are an autonomous coding agent operating inside a bounded workspace.
 
-You have access to tools for inspecting and modifying the project.
-
-Task state has the following semantics:
-
-- `task` is the user's original task. It is runtime-owned and cannot be changed.
-- `status` is the runtime's execution status. It is runtime-owned and cannot be changed.
-- `files` contains files actually modified or created by the runtime. It is runtime-owned.
-- `current` describes the task-level work you are currently performing.
-- `completed` is your current understanding of which task-level steps are complete.
-- `blocked` contains task-level blockers or reasons you currently believe prevent progress.
-
-Use `set_task_state` to keep `current`, `completed`, and `blocked` up to date.
-
-`completed` and `blocked` are replacement-based lists. When updating either one,
-provide the complete current list rather than only newly added items.
-
-Your task-state description is not authoritative about what actually happened.
-The runtime determines execution status and records files that were modified.
-Do not claim a task is complete merely because you set `completed`; completion is
-determined by the runtime after you finish the requested work.
-
-When you encounter an error, inspect the error and attempt to recover when possible.
-Do not perform actions outside the available tools or invent tool results.
-""".strip()
 
 class ModelClient(Protocol):
     async def generate(
@@ -100,12 +75,13 @@ class AgentRuntime:
         if not isinstance(path, str):
             return
 
-        state = self.server.state.load()
+        state = self.server.get_active_task_state()
+        if not state.active:
+            return
 
         if path not in state.files:
             state.files.append(path)
-
-        self.server.state.save(state)
+            self.server.save_active_task_state(state)
 
     def set_stream_handler(
         self,
@@ -121,7 +97,9 @@ class AgentRuntime:
         return [
             {
                 "role": "system",
-                "content": TASK_STATE_SYSTEM_PROMPT,
+                "content": build_system_prompt(
+                    self.server.context.identity
+                ),
             }
         ]
 
@@ -145,7 +123,8 @@ class AgentRuntime:
         )
 
         return await self._run_messages(
-            messages
+            messages,
+            auto_complete_task=True,
         )
 
     async def run_chat_turn(self, messages: list[dict[str, Any]], user_message: str) -> str:
@@ -161,8 +140,6 @@ class AgentRuntime:
                 self.create_chat_history()
             )
 
-        self._initialize_task(user_message)
-
         messages.append(
             {
                 "role": "user",
@@ -171,10 +148,16 @@ class AgentRuntime:
         )
 
         return await self._run_messages(
-            messages
+            messages,
+            auto_complete_task=False,
         )
 
-    async def _run_messages(self, messages: list[dict[str, Any]]) -> str:
+    async def _run_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        auto_complete_task: bool,
+    ) -> str:
         for _ in range(self.max_iterations):
             self._tool_call_count = 0
 
@@ -229,16 +212,19 @@ class AgentRuntime:
                     }
                 )
 
-                state = self.server.state.load()
-                state.status = "completed"
-                self.server.state.save(state)
+                state = self.server.get_active_task_state()
+                if (
+                    auto_complete_task
+                    and state.active
+                    and state.status == "in_progress"
+                ):
+                    state = self.server.finish_active_task("completed")
 
                 self._last_heartbeat = {
-                    "status": state.status,
-                    "task": state.task,
-                    "iteration": (
-                        self._tool_call_count
-                    ),
+                    "status": state.status if state.active else "idle",
+                    "task_id": state.task_id,
+                    "task": state.title if state.active else None,
+                    "iteration": self._tool_call_count,
                     "last_tool": None,
                 }
 
@@ -397,27 +383,30 @@ class AgentRuntime:
             }
         )
 
-        state = self.server.state.load()
-        state.status = "blocked"
-        state.blocked.append(
-            "Maximum iteration limit reached "
-            "before task completion."
-        )
-        self.server.state.save(state)
+        state = self.server.get_active_task_state()
+        if state.active and state.status == "in_progress":
+            blocker = (
+                "Maximum iteration limit reached before task completion."
+            )
+            if blocker not in state.blocked:
+                state.blocked.append(blocker)
+            state.status = "blocked"
+            self.server.save_active_task_state(state)
 
         return content
 
     def _initialize_task(self, task: str) -> None:
-        state = self.server.state.load()
+        self.server.start_task(
+            title=self._task_title(task),
+            goal=task,
+        )
 
-        state.task = task
-        state.status = "in_progress"
-        state.current = ""
-        state.completed = []
-        state.blocked = []
-        state.files = []
-
-        self.server.state.save(state)
+    @staticmethod
+    def _task_title(task: str) -> str:
+        compact = " ".join(task.split())
+        if len(compact) <= 120:
+            return compact
+        return compact[:117].rstrip() + "..."
 
     async def _get_tools(self) -> list[dict[str, Any]]:
         tools = await self.server.mcp.list_tools()

@@ -6,7 +6,8 @@ from agent.model import LlamaCppClient
 from agent.runtime import AgentRuntime, AgentResponse
 from agent.mcp_.agent_server import AgentServer
 from pathlib import Path
-
+from agent.context import AgentIdentity
+from agent.state import TaskState
 
 @pytest.fixture
 def mock_client():
@@ -16,11 +17,46 @@ def mock_client():
 @pytest.fixture
 def mock_server():
     server = MagicMock(spec=AgentServer)
+
     server.mcp = AsyncMock()
     server.mcp.list_tools = AsyncMock(return_value=[])
-    server.state = MagicMock()
-    server.state.load = MagicMock(return_value=MagicMock(files=[]))
-    server.state.save = MagicMock()
+    
+    server.context = MagicMock()
+    server.context.identity = AgentIdentity(
+        name="Test Agent",
+        role="test agent",
+        description="Agent used by unit tests."
+    )
+
+    active_state = TaskState(
+        task_id="task_test",
+        title="Test task",
+        goal="Test task",
+        status="in_progress",
+        revision=1,
+    )
+
+    completed_state = TaskState(
+        task_id="task_test",
+        title="Test task",
+        goal="Test task",
+        status="completed",
+        revision=2,
+    )
+
+    server.start_task = MagicMock(
+        return_value=active_state,
+    )
+    server.get_active_task_state = MagicMock(
+        return_value=active_state,
+    )
+    server.save_active_task_state = MagicMock(
+        return_value=active_state,
+    )
+    server.finish_active_task = MagicMock(
+        return_value=completed_state,
+    )
+
     return server
 
 

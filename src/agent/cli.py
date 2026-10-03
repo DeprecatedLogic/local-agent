@@ -14,7 +14,7 @@ from agent.runtime import AgentRuntime
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the local coding agent.",
+        description="Run the local agent.",
     )
 
     parser.add_argument(
@@ -22,6 +22,15 @@ def create_parser() -> argparse.ArgumentParser:
         required=False,
         default="/srv/local-agent-workspace",
         help="Path to the project workspace.",
+    )
+
+    parser.add_argument(
+        "--config-dir",
+        default=None,
+        help=(
+            "Agent configuration directory. Defaults to "
+            "$LOCAL_AGENT_CONFIG_DIR or ~/.config/local-agent."
+        ),
     )
 
     parser.add_argument(
@@ -81,7 +90,10 @@ def create_runtime(
     args: argparse.Namespace,
     dry_run: bool = False,
 ) -> AgentRuntime:
-    server = AgentServer(args.workspace)
+    server = AgentServer(
+        args.workspace,
+        config_dir=args.config_dir,
+    )
 
     if dry_run:
         fs = server.filesystem
@@ -220,12 +232,9 @@ async def async_main(
         print(result)
 
     finally:
-        runtime.server.state.save(
-            runtime.server.state.load()
-        )
-
+        # SQLite task writes are committed transactionally at mutation time;
+        # there is no mutable in-memory state that needs a shutdown flush.
         await health.stop()
-
         _notify_systemd("STOPPING=1")
 
 

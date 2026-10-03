@@ -119,6 +119,10 @@ class Git:
         branch = result.stdout.strip()
         return branch or None
 
+    @staticmethod
+    def _is_internal_path(path: str) -> bool:
+        return path == ".agent" or path.startswith(".agent/")
+
     def status(self) -> dict:
         result = self._run(
             [
@@ -161,6 +165,9 @@ class Git:
             elif line.startswith("1 "):
                 entry = self._parse_changed_entry(line)
 
+                if self._is_internal_path(entry["path"]):
+                    continue
+
                 if entry["index_status"] != ".":
                     staged.append(entry)
 
@@ -170,6 +177,9 @@ class Git:
             elif line.startswith("2 "):
                 entry = self._parse_rename_entry(line)
 
+                if self._is_internal_path(entry["path"]):
+                    continue
+
                 if entry["index_status"] != ".":
                     staged.append(entry)
 
@@ -178,10 +188,14 @@ class Git:
 
             elif line.startswith("u "):
                 entry = self._parse_unmerged_entry(line)
+                if self._is_internal_path(entry["path"]):
+                    continue
                 conflicted.append(entry)
 
             elif line.startswith("? "):
                 path = line[2:]
+                if self._is_internal_path(path):
+                    continue
 
                 untracked.append(
                     {

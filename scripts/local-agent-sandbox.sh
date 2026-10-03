@@ -431,11 +431,11 @@ main() {
     echo
     echo "The old persistent local-agent.service is no longer used."
     echo \
-        "Each invocation runs as a transient, hardened systemd service " \
+        "Each invocation runs as a transient, hardened systemd service" \
         "attached to your terminal."
     echo
     echo \
-        "After changing local-agent source code, rerun this installer " \
+        "After changing local-agent source code, rerun this installer" \
         "to refresh the isolated runtime."
 }
 

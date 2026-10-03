@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-agent"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.14"
 dependencies = [
     "fastmcp",
@@ -24,3 +24,6 @@ dev = ["pytest>=7.0", "anyio>=4.0", "httpx>=0.25", "mypy>=1.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+agent = ["manual/*.md"]
