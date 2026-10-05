@@ -5,6 +5,12 @@ from agent.mcp_.filesystem import Filesystem
 from agent.mcp_.search import Search
 from agent.mcp_.workspace import Workspace
 from agent.context import AgentContextStore
+from agent.embeddings import EmbeddingProvider
+from agent.session import (
+    ChatHistorySearch,
+    ChatSessionAccess,
+    ChatSessionStore,
+)
 from agent.state import ActiveTaskStateStore, TaskState, TaskStatus, TaskStore
 from agent.mcp_.git import Git
 from agent.command import CommandExecutor
@@ -17,11 +23,25 @@ class AgentServer:
         workspace_path: str,
         *,
         config_dir: str | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         self.workspace = Workspace(workspace_path)
         self.context = AgentContextStore(config_dir)
         self.tasks = TaskStore(
             self.workspace.resolve(".agent/task_history.db")
+        )
+        self.chat_sessions = ChatSessionStore(
+            self.workspace.resolve(".agent/chat_history.db")
+        )
+        self.chat_access = ChatSessionAccess()
+        self.current_chat_session_id: str | None = None
+        self.chat_search = (
+            ChatHistorySearch(
+                self.chat_sessions,
+                embedding_provider,
+            )
+            if embedding_provider is not None
+            else None
         )
         self.active_task_id: str | None = None
 
@@ -95,6 +115,32 @@ class AgentServer:
         state.status = status
         return self.tasks.save_state(state)
 
+    def attach_task(self, task_id: str | None) -> TaskState:
+        """Attach an existing unfinished task to the current runtime session.
+
+        This restores only the active-task pointer. It never changes task status,
+        so resuming a chat cannot implicitly unblock or otherwise mutate a task.
+        """
+        if task_id is None:
+            self.active_task_id = None
+            return TaskState()
+
+        state = self.tasks.get_state(task_id)
+        if state.status in {"completed", "cancelled"}:
+            self.active_task_id = None
+            return TaskState()
+
+        self.active_task_id = task_id
+        return state
+
+    def readable_chat_session_ids(self) -> list[str]:
+        """Return saved session IDs visible through the current chat capability."""
+        return [
+            session_id
+            for session_id in self.chat_sessions.all_session_ids()
+            if self.chat_access.can_read(session_id)
+        ]
+
     def _register_tools(self) -> None:
 
         @self.mcp.tool()
@@ -124,6 +170,114 @@ class AgentServer:
             Retrieve a specific topic only when its detailed guidance is relevant to the current work.
             """
             return self.context.get(topic)
+
+        @self.mcp.tool()
+        def list_chat_sessions(
+            limit: int = 10,
+            before: str | None = None,
+            query: str | None = None,
+        ) -> list[dict]:
+            """
+            List compact metadata for saved chat sessions.
+
+            This reveals titles, IDs, timestamps, message counts, and task links,
+            but never conversation contents. Use query to filter session titles.
+            """
+            return [
+                session.to_dict()
+                for session in self.chat_sessions.list_sessions(
+                    limit=limit,
+                    before=before,
+                    query=query,
+                )
+            ]
+
+        @self.mcp.tool()
+        def read_chat_session(
+            session_id: str,
+            limit: int = 20,
+            before_sequence: int | None = None,
+            around_sequence: int | None = None,
+            role: Literal["user", "agent"] | None = None,
+        ) -> dict:
+            """
+            Read a bounded page from an explicitly authorized saved chat session.
+
+            role="user" returns only user messages, role="agent" returns only
+            assistant messages, and null returns both. Tool/system messages are not
+            returned. The user grants temporary cross-session access with
+            /allow-sessions; this tool cannot grant access to itself.
+            """
+            resolved = self.chat_sessions.resolve_session_id(session_id)
+            if not self.chat_access.can_read(resolved):
+                raise PermissionError(
+                    "Chat session is not authorized for cross-session reading. "
+                    "The user can grant access with /allow-sessions <session-id> "
+                    "or /allow-sessions all."
+                )
+            return self.chat_sessions.read_messages(
+                resolved,
+                limit=limit,
+                before_sequence=before_sequence,
+                around_sequence=around_sequence,
+                role=role,
+            )
+
+        @self.mcp.tool()
+        def search_chat_history(
+            query: str,
+            role: Literal["user", "agent"] | None = None,
+            limit: int = 5,
+        ) -> list[dict]:
+            """
+            Semantically search authorized saved chat history using chunk embeddings.
+
+            Results are bounded and contain session IDs, chunk ranges, similarity
+            scores, and short previews. role selects the user-only, agent-only, or
+            combined chunk view. Use read_chat_session around a returned sequence
+            range only when more exact context is needed.
+            """
+            session_ids = self.readable_chat_session_ids()
+            if not session_ids:
+                raise PermissionError(
+                    "No saved chat sessions are authorized for cross-session search. "
+                    "The user can grant access with /allow-sessions <session-id> "
+                    "or /allow-sessions all."
+                )
+            if self.chat_search is None:
+                raise RuntimeError(
+                    "Semantic chat search is unavailable because no embedding "
+                    "provider is configured."
+                )
+            return self.chat_search.search(
+                query,
+                session_ids,
+                role=role,
+                limit=limit,
+            )
+
+        @self.mcp.tool()
+        def delete_chat_session(session_id: str) -> dict:
+            """
+            Permanently delete one saved chat session when the user explicitly asks.
+
+            This never deletes task history. The currently active chat cannot be
+            deleted through MCP because doing so mid-turn would invalidate the live
+            conversation; use /delete-current for that case. There is intentionally
+            no MCP tool for deleting all sessions.
+            """
+            resolved = self.chat_sessions.resolve_session_id(session_id)
+            if resolved == self.current_chat_session_id:
+                raise RuntimeError(
+                    "Cannot delete the current live chat through MCP. "
+                    "Use /delete-current instead."
+                )
+            self.chat_sessions.delete_session(resolved)
+            self.chat_access.forget_session(resolved)
+            return {
+                "deleted": True,
+                "session_id": resolved,
+            }
 
         @self.mcp.tool()
         def start_task(title: str, goal: str) -> dict:

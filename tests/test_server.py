@@ -43,6 +43,10 @@ def test_server_registers_expected_tools(tmp_path):
     assert names == {
         "project_info",
         "get_agent_context",
+        "list_chat_sessions",
+        "read_chat_session",
+        "search_chat_history",
+        "delete_chat_session",
         "start_task",
         "resume_task",
         "get_task_state",

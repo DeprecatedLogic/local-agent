@@ -5,6 +5,7 @@ import inspect
 from cysystemd import daemon
 
 from agent.chat import ChatSession
+from agent.embeddings import LlamaCppEmbeddingClient
 from agent.health import HealthMonitor
 from agent.logging_config import setup_logging
 from agent.mcp_.agent_server import AgentServer
@@ -43,6 +44,18 @@ def create_parser() -> argparse.ArgumentParser:
         "--model",
         default="local-agent",
         help="Model identifier sent to llama-server.",
+    )
+
+    parser.add_argument(
+        "--embedding-url",
+        default="http://127.0.0.1:8081",
+        help="Base URL of the llama.cpp embedding server.",
+    )
+
+    parser.add_argument(
+        "--embedding-model",
+        default="bge-small-en-v1.5",
+        help="Model identifier sent to the embedding server.",
     )
 
     parser.add_argument(
@@ -90,9 +103,15 @@ def create_runtime(
     args: argparse.Namespace,
     dry_run: bool = False,
 ) -> AgentRuntime:
+    embedding_provider = LlamaCppEmbeddingClient(
+        base_url=args.embedding_url,
+        model=args.embedding_model,
+    )
+
     server = AgentServer(
         args.workspace,
         config_dir=args.config_dir,
+        embedding_provider=embedding_provider,
     )
 
     if dry_run:
