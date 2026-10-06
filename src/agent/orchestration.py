@@ -19,11 +19,20 @@ DelegationStatus = Literal[
 ]
 
 
+DEFAULT_MAX_CONTEXT_TOKENS = 32768
+DEFAULT_MAX_REASONING_TOKENS = 4096
+
+
 DEFAULT_AGENTS_TOML = '''# Local Agent specialist definitions.
 #
 # This file is created automatically when missing. Existing values are never
 # overwritten during updates. Add/remove/rename agents here; no Python changes
 # are required. Tool groups are reusable shortcuts and may also be customized.
+
+[defaults]
+# Logical per-specialist token budgets. Individual agents may override either value.
+max_context_tokens = 32768
+max_reasoning_tokens = 4096
 
 [tool_groups]
 inspect = [
@@ -141,7 +150,6 @@ class DelegationLimits:
     worker_timeout_seconds: float = 180.0
     worker_max_iterations: int = 8
     worker_max_tool_calls: int = 24
-    worker_reasoning_budget: int = 4096
     max_result_chars: int = 6000
 
     def __post_init__(self) -> None:
@@ -155,8 +163,6 @@ class DelegationLimits:
             raise ValueError("worker_max_iterations must be at least 1")
         if self.worker_max_tool_calls < 1:
             raise ValueError("worker_max_tool_calls must be at least 1")
-        if self.worker_reasoning_budget < 1:
-            raise ValueError("worker_reasoning_budget must be at least 1")
         if self.max_result_chars < 256:
             raise ValueError("max_result_chars must be at least 256")
 
@@ -169,10 +175,11 @@ class AgentSpec:
     instructions: str
     allowed_tools: frozenset[str]
     backend_id: str = "primary"
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
+    max_reasoning_tokens: int = DEFAULT_MAX_REASONING_TOKENS
     timeout_seconds: float | None = None
     max_iterations: int | None = None
     max_tool_calls: int | None = None
-    reasoning_budget: int | None = None
     max_result_chars: int | None = None
 
     def tool_policy(self) -> ToolPolicy:
@@ -190,9 +197,6 @@ class AgentSpec:
     def effective_tool_calls(self, defaults: DelegationLimits) -> int:
         return self.max_tool_calls or defaults.worker_max_tool_calls
 
-    def effective_reasoning_budget(self, defaults: DelegationLimits) -> int:
-        return self.reasoning_budget or defaults.worker_reasoning_budget
-
     def effective_result_chars(self, defaults: DelegationLimits) -> int:
         return self.max_result_chars or defaults.max_result_chars
 
@@ -202,6 +206,8 @@ class AgentSession:
     id: str
     agent_id: str
     backend_id: str
+    max_context_tokens: int
+    max_reasoning_tokens: int
     started_at: str
 
     @classmethod
@@ -210,6 +216,8 @@ class AgentSession:
             id=f"agent_session_{uuid4().hex}",
             agent_id=spec.id,
             backend_id=spec.backend_id,
+            max_context_tokens=spec.max_context_tokens,
+            max_reasoning_tokens=spec.max_reasoning_tokens,
             started_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
 
@@ -347,6 +355,30 @@ class AgentRegistry:
         with path.open("rb") as file:
             data = tomllib.load(file)
 
+        raw_defaults = data.get("defaults", {})
+        if not isinstance(raw_defaults, dict):
+            raise ValueError("agents.toml [defaults] must be a table")
+
+        default_max_context_tokens = (
+            cls._positive_int(
+                raw_defaults.get("max_context_tokens"),
+                field_name="defaults.max_context_tokens",
+            )
+            or DEFAULT_MAX_CONTEXT_TOKENS
+        )
+        default_max_reasoning_tokens = (
+            cls._positive_int(
+                raw_defaults.get("max_reasoning_tokens"),
+                field_name="defaults.max_reasoning_tokens",
+            )
+            or DEFAULT_MAX_REASONING_TOKENS
+        )
+        if default_max_reasoning_tokens > default_max_context_tokens:
+            raise ValueError(
+                "defaults.max_reasoning_tokens cannot exceed "
+                "defaults.max_context_tokens"
+            )
+
         raw_groups = data.get("tool_groups", {})
         if not isinstance(raw_groups, dict):
             raise ValueError("agents.toml [tool_groups] must be a table")
@@ -396,6 +428,36 @@ class AgentRegistry:
                         f"agents.{agent_id} references unknown tool group: {group_name}"
                     ) from exc
 
+            max_context_tokens = (
+                cls._positive_int(
+                    raw_spec.get("max_context_tokens"),
+                    field_name=f"agents.{agent_id}.max_context_tokens",
+                )
+                or default_max_context_tokens
+            )
+
+            legacy_reasoning_budget = raw_spec.get("reasoning_budget")
+            if (
+                raw_spec.get("max_reasoning_tokens") is not None
+                and legacy_reasoning_budget is not None
+            ):
+                raise ValueError(
+                    f"agents.{agent_id} cannot define both max_reasoning_tokens "
+                    "and legacy reasoning_budget"
+                )
+            max_reasoning_tokens = (
+                cls._positive_int(
+                    raw_spec.get("max_reasoning_tokens", legacy_reasoning_budget),
+                    field_name=f"agents.{agent_id}.max_reasoning_tokens",
+                )
+                or default_max_reasoning_tokens
+            )
+            if max_reasoning_tokens > max_context_tokens:
+                raise ValueError(
+                    f"agents.{agent_id}.max_reasoning_tokens cannot exceed "
+                    f"agents.{agent_id}.max_context_tokens"
+                )
+
             max_result_chars = cls._positive_int(
                 raw_spec.get("max_result_chars"),
                 field_name=f"agents.{agent_id}.max_result_chars",
@@ -439,10 +501,8 @@ class AgentRegistry:
                         raw_spec.get("max_tool_calls"),
                         field_name=f"agents.{agent_id}.max_tool_calls",
                     ),
-                    reasoning_budget=cls._positive_int(
-                        raw_spec.get("reasoning_budget"),
-                        field_name=f"agents.{agent_id}.reasoning_budget",
-                    ),
+                    max_context_tokens=max_context_tokens,
+                    max_reasoning_tokens=max_reasoning_tokens,
                     max_result_chars=max_result_chars,
                 )
             )
@@ -469,6 +529,8 @@ class AgentRegistry:
                 "name": spec.name,
                 "description": spec.description,
                 "backend_id": spec.backend_id,
+                "max_context_tokens": spec.max_context_tokens,
+                "max_reasoning_tokens": spec.max_reasoning_tokens,
                 "tools": sorted(spec.allowed_tools),
             }
             for spec in sorted(self._specs.values(), key=lambda item: item.id)
@@ -578,10 +640,9 @@ class DelegationManager:
     ) -> DelegationResult:
         from agent.runtime import AgentRuntime
 
-        reasoning_budget = spec.effective_reasoning_budget(self.limits)
         model = self._worker_model(
             self.backends[spec.backend_id],
-            reasoning_budget,
+            session.max_reasoning_tokens,
         )
         runtime = AgentRuntime(
             server=self.server,
@@ -681,6 +742,8 @@ You are a depth-one specialist working for the primary local agent.
 Specialist: {spec.name} ({spec.id})
 Logical session: {session.id}
 Backend: {session.backend_id}
+Context token budget: {session.max_context_tokens}
+Reasoning token budget: {session.max_reasoning_tokens}
 
 Role:
 {spec.description}

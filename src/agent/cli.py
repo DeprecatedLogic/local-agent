@@ -103,13 +103,6 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--worker-reasoning-budget",
-        type=int,
-        default=4096,
-        help="Reasoning-token budget used by llama.cpp specialist requests.",
-    )
-
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -222,7 +215,6 @@ def create_runtime(
             worker_timeout_seconds=args.worker_timeout,
             worker_max_iterations=args.worker_max_iterations,
             worker_max_tool_calls=args.worker_max_tools,
-            worker_reasoning_budget=args.worker_reasoning_budget,
         ),
     )
     runtime.set_delegation_manager(delegation)
