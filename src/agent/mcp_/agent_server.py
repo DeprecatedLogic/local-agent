@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from collections.abc import Awaitable, Callable
 from fastmcp import FastMCP
 from agent.mcp_.filesystem import Filesystem
 from agent.mcp_.search import Search
@@ -44,6 +45,10 @@ class AgentServer:
             else None
         )
         self.active_task_id: str | None = None
+        self._delegation_handler: (
+            Callable[[str, str, str | None], Awaitable[dict]] | None
+        ) = None
+        self._agent_catalog_handler: Callable[[], list[dict]] | None = None
 
         # Transitional compatibility for code/tests that still access server.state.
         self.state = ActiveTaskStateStore(
@@ -58,6 +63,18 @@ class AgentServer:
         self.mcp = FastMCP("local-agent")
 
         self._register_tools()
+
+    def set_delegation_handler(
+        self,
+        handler: Callable[[str, str, str | None], Awaitable[dict]] | None,
+    ) -> None:
+        self._delegation_handler = handler
+
+    def set_agent_catalog_handler(
+        self,
+        handler: Callable[[], list[dict]] | None,
+    ) -> None:
+        self._agent_catalog_handler = handler
 
     def start_task(self, title: str, goal: str) -> TaskState:
         if self.active_task_id is not None:
@@ -278,6 +295,42 @@ class AgentServer:
                 "deleted": True,
                 "session_id": resolved,
             }
+
+        @self.mcp.tool()
+        def list_agents() -> list[dict]:
+            """
+            List specialist agents configured for bounded delegation.
+
+            Agent definitions are loaded from the user's agents.toml file at startup.
+            The catalog includes each enabled agent's ID, name, description, backend,
+            and configured tools.
+            """
+            if self._agent_catalog_handler is None:
+                raise RuntimeError(
+                    "Agent catalog is unavailable because no orchestrator is attached."
+                )
+            return self._agent_catalog_handler()
+
+        @self.mcp.tool()
+        async def delegate_task(
+            agent: str,
+            task: str,
+            context: str | None = None,
+        ) -> dict:
+            """
+            Delegate one bounded, self-contained subtask to a configured specialist.
+
+            Use list_agents to inspect the currently enabled specialists. Agent IDs are
+            user-configurable and are not hardcoded into this tool schema. Workers are
+            depth-one and cannot recursively delegate or own the parent task lifecycle.
+            The primary agent remains responsible for integrating and validating the
+            specialist result.
+            """
+            if self._delegation_handler is None:
+                raise RuntimeError(
+                    "Delegation is unavailable because no orchestrator is attached."
+                )
+            return await self._delegation_handler(agent, task, context)
 
         @self.mcp.tool()
         def start_task(title: str, goal: str) -> dict:

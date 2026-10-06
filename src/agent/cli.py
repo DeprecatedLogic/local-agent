@@ -10,6 +10,12 @@ from agent.health import HealthMonitor
 from agent.logging_config import setup_logging
 from agent.mcp_.agent_server import AgentServer
 from agent.model import LlamaCppClient
+from agent.orchestration import (
+    AgentRegistry,
+    DelegationLimits,
+    DelegationManager,
+    build_orchestrator_system_suffix,
+)
 from agent.runtime import AgentRuntime
 
 
@@ -66,6 +72,41 @@ def create_parser() -> argparse.ArgumentParser:
             "Maximum number of agent iterations "
             "per user turn."
         ),
+    )
+
+    parser.add_argument(
+        "--max-delegations",
+        type=int,
+        default=4,
+        help="Maximum specialist delegations per user turn.",
+    )
+
+    parser.add_argument(
+        "--worker-timeout",
+        type=float,
+        default=180.0,
+        help="Maximum seconds allowed for one specialist delegation.",
+    )
+
+    parser.add_argument(
+        "--worker-max-iterations",
+        type=int,
+        default=8,
+        help="Maximum model/tool iterations for one specialist.",
+    )
+
+    parser.add_argument(
+        "--worker-max-tools",
+        type=int,
+        default=24,
+        help="Maximum tool calls allowed for one specialist.",
+    )
+
+    parser.add_argument(
+        "--worker-reasoning-budget",
+        type=int,
+        default=4096,
+        help="Reasoning-token budget used by llama.cpp specialist requests.",
     )
 
     parser.add_argument(
@@ -160,11 +201,35 @@ def create_runtime(
         model=args.model,
     )
 
-    return AgentRuntime(
+    registry = AgentRegistry.from_config_dir(
+        server.context.config_dir
+    )
+
+    runtime = AgentRuntime(
         server=server,
         model=model,
         max_iterations=args.max_iterations,
+        system_prompt_suffix=build_orchestrator_system_suffix(registry),
     )
+
+    delegation = DelegationManager(
+        server,
+        {"primary": model},
+        registry=registry,
+        limits=DelegationLimits(
+            max_delegations_per_turn=args.max_delegations,
+            max_concurrent_workers=1,
+            worker_timeout_seconds=args.worker_timeout,
+            worker_max_iterations=args.worker_max_iterations,
+            worker_max_tool_calls=args.worker_max_tools,
+            worker_reasoning_budget=args.worker_reasoning_budget,
+        ),
+    )
+    runtime.set_delegation_manager(delegation)
+    server.set_delegation_handler(delegation.delegate)
+    server.set_agent_catalog_handler(delegation.available_agents)
+
+    return runtime
 
 
 async def run_agent(
@@ -251,8 +316,6 @@ async def async_main(
         print(result)
 
     finally:
-        # SQLite task writes are committed transactionally at mutation time;
-        # there is no mutable in-memory state that needs a shutdown flush.
         await health.stop()
         _notify_systemd("STOPPING=1")
 

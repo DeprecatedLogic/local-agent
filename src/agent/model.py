@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
 
 from agent.events import AgentEvent, StreamHandler
+
 
 @dataclass(frozen=True)
 class GenerationConfig:
@@ -22,6 +23,7 @@ class GenerationConfig:
         "Maintain identity and conversation context. "
         "Answer from existing conclusions.</system>"
     )
+
 
 class LlamaCppClient:
     def __init__(
@@ -41,6 +43,22 @@ class LlamaCppClient:
             read=None,
             write=30.0,
             pool=10.0,
+        )
+
+    def with_reasoning_budget(self, reasoning_budget: int) -> "LlamaCppClient":
+        """Create a logical client for the same backend with a smaller budget."""
+        if reasoning_budget < 1:
+            raise ValueError("reasoning_budget must be at least 1")
+
+        return LlamaCppClient(
+            base_url=self.base_url,
+            model=self.model,
+            generation=replace(
+                self.generation,
+                reasoning_budget=reasoning_budget,
+            ),
+            transport=self.transport,
+            timeout=self.timeout,
         )
 
     async def generate(
@@ -145,19 +163,13 @@ class LlamaCppClient:
                             ),
                         }
 
-                    choices = chunk.get(
-                        "choices",
-                        [],
-                    )
+                    choices = chunk.get("choices", [])
 
                     if not choices:
                         continue
 
                     choice = choices[0]
-                    delta = choice.get(
-                        "delta",
-                        {},
-                    )
+                    delta = choice.get("delta", {})
 
                     if choice.get("finish_reason") is not None:
                         finish_reason = choice["finish_reason"]
@@ -178,10 +190,7 @@ class LlamaCppClient:
                                 )
                             )
 
-                    content_delta = (
-                        delta.get("content")
-                        or ""
-                    )
+                    content_delta = delta.get("content") or ""
 
                     if content_delta:
                         content += content_delta
@@ -194,14 +203,8 @@ class LlamaCppClient:
                                 )
                             )
 
-                    for tool_delta in delta.get(
-                        "tool_calls",
-                        [],
-                    ):
-                        index = tool_delta.get(
-                            "index",
-                            0,
-                        )
+                    for tool_delta in delta.get("tool_calls", []):
+                        index = tool_delta.get("index", 0)
 
                         while len(tool_calls) <= index:
                             tool_calls.append(
@@ -218,29 +221,20 @@ class LlamaCppClient:
                         current = tool_calls[index]
 
                         if tool_delta.get("id"):
-                            current["id"] = (
-                                tool_delta["id"]
-                            )
+                            current["id"] = tool_delta["id"]
 
                         if tool_delta.get("type"):
-                            current["type"] = (
-                                tool_delta["type"]
-                            )
+                            current["type"] = tool_delta["type"]
 
-                        function = tool_delta.get(
-                            "function",
-                            {},
-                        )
+                        function = tool_delta.get("function", {})
 
                         if function.get("name"):
-                            current["function"]["name"] += (
-                                function["name"]
-                            )
+                            current["function"]["name"] += function["name"]
 
                         if function.get("arguments"):
-                            current["function"][
-                                "arguments"
-                            ] += function["arguments"]
+                            current["function"]["arguments"] += (
+                                function["arguments"]
+                            )
 
         message: dict[str, Any] = {
             "role": "assistant",
@@ -248,9 +242,7 @@ class LlamaCppClient:
         }
 
         if reasoning_content:
-            message["reasoning_content"] = (
-                reasoning_content
-            )
+            message["reasoning_content"] = reasoning_content
 
         if tool_calls:
             message["tool_calls"] = tool_calls

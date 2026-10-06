@@ -47,6 +47,8 @@ def test_server_registers_expected_tools(tmp_path):
         "read_chat_session",
         "search_chat_history",
         "delete_chat_session",
+        "list_agents",
+        "delegate_task",
         "start_task",
         "resume_task",
         "get_task_state",
