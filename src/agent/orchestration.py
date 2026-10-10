@@ -403,6 +403,24 @@ class AgentRegistry:
             if not isinstance(raw_spec, dict):
                 raise ValueError(f"agents.{agent_id} must be a table")
 
+            if "reasoning_budget" in raw_spec:
+                raise ValueError(
+                    f"agents.{agent_id}.reasoning_budget is no longer supported; "
+                    "use max_reasoning_tokens"
+                )
+            supported_fields = {
+                "enabled", "name", "description", "instructions", "backend",
+                "tool_groups", "tools", "timeout_seconds", "max_iterations",
+                "max_tool_calls", "max_context_tokens", "max_reasoning_tokens",
+                "max_result_chars",
+            }
+            unknown = set(raw_spec) - supported_fields
+            if unknown:
+                raise ValueError(
+                    f"unsupported agents.{agent_id} setting(s): "
+                    + ", ".join(sorted(unknown))
+                )
+
             enabled = raw_spec.get("enabled", True)
             if not isinstance(enabled, bool):
                 raise ValueError(f"agents.{agent_id}.enabled must be boolean")
@@ -436,18 +454,9 @@ class AgentRegistry:
                 or default_max_context_tokens
             )
 
-            legacy_reasoning_budget = raw_spec.get("reasoning_budget")
-            if (
-                raw_spec.get("max_reasoning_tokens") is not None
-                and legacy_reasoning_budget is not None
-            ):
-                raise ValueError(
-                    f"agents.{agent_id} cannot define both max_reasoning_tokens "
-                    "and legacy reasoning_budget"
-                )
             max_reasoning_tokens = (
                 cls._positive_int(
-                    raw_spec.get("max_reasoning_tokens", legacy_reasoning_budget),
+                    raw_spec.get("max_reasoning_tokens"),
                     field_name=f"agents.{agent_id}.max_reasoning_tokens",
                 )
                 or default_max_reasoning_tokens

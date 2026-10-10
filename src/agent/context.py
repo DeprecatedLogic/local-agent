@@ -11,10 +11,51 @@ import tomllib
 class AgentIdentity:
     name: str = "Local Agent"
     role: str = "autonomous local Linux agent"
-    description: str = (
-        "A general-purpose local agent that investigates, reasons, and acts "
-        "through the tools exposed by its runtime."
-    )
+    description: str = """
+        A general-purpose local agent that investigates, reasons, and acts through the
+        tools exposed by its runtime.
+
+        You operate as a Linux user inside boundaries enforced by the runtime. Your tools are
+        an extension of your ability to observe and act on reality.
+
+        Prefer direct evidence over assumptions when a claim depends on current,
+        environment-specific, system-dependent, filesystem-dependent, repository-dependent,
+        runtime-dependent, version-dependent, or otherwise observable information. Never
+        invent tool results, command output, file contents, software versions, system state,
+        test results, successful actions, or other observations. If temporal reasoning depends
+        on whether something is past, present, or future, observe the current date/time first.
+
+        Use tools when they materially improve correctness. Respect runtime boundaries and do
+        not assume privileges or capabilities you have not established. Before meaningful
+        modifications, inspect relevant state; afterward, validate the result using the
+        strongest practical evidence available.
+
+        Ordinary conversation is not automatically a persistent task. Use start_task only for
+        substantive work that benefits from progress tracking or later resumption. Do not
+        create tasks for greetings, casual conversation, or trivial factual questions. When a
+        persistent task is active, keep its progress accurate with the task-state tools and
+        finish it explicitly when appropriate.
+
+        Detailed operating guidance is available through get_agent_context. Consult only the
+        relevant topic when more detail is needed; do not load guidance merely for appearance.
+
+        When evidence is insufficient, preserve the uncertainty. Correctness, evidence, and
+        truthfulness take priority over confidence, fluency, speed, or completeness.
+    """.strip()
+
+
+def resolve_config_dir(config_dir: str | Path | None = None) -> Path:
+    """Resolve the Local Agent config directory without mutating it."""
+    if config_dir is not None:
+        return Path(config_dir).expanduser().resolve()
+
+    configured = os.environ.get("LOCAL_AGENT_CONFIG_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return (base / "local-agent").resolve()
 
 
 class AgentContextStore:
@@ -22,24 +63,11 @@ class AgentContextStore:
 
     def __init__(self, config_dir: str | Path | None = None):
         self.package_manual_dir = Path(__file__).with_name("manual")
-        self.config_dir = self._resolve_config_dir(config_dir)
+        self.config_dir = resolve_config_dir(config_dir)
         self.manual_dir = self.config_dir / "manual"
 
         self._ensure_config()
         self.identity = self._load_identity()
-
-    @staticmethod
-    def _resolve_config_dir(config_dir: str | Path | None) -> Path:
-        if config_dir is not None:
-            return Path(config_dir).expanduser().resolve()
-
-        configured = os.environ.get("LOCAL_AGENT_CONFIG_DIR")
-        if configured:
-            return Path(configured).expanduser().resolve()
-
-        xdg = os.environ.get("XDG_CONFIG_HOME")
-        base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-        return (base / "local-agent").resolve()
 
     def _ensure_config(self) -> None:
         """Seed editable config defaults without overwriting user-owned files."""
@@ -48,6 +76,20 @@ class AgentContextStore:
         self._write_if_missing(
             self.config_dir / "identity.toml",
             self._default_identity_toml(),
+        )
+
+        # All editable defaults are part of the same first-run setup.
+        # Import lazily because both registries also use config-directory helpers.
+        from agent.backends import DEFAULT_MODELS_TOML
+        from agent.orchestration import DEFAULT_AGENTS_TOML
+
+        self._write_if_missing(
+            self.config_dir / "models.toml",
+            DEFAULT_MODELS_TOML,
+        )
+        self._write_if_missing(
+            self.config_dir / "agents.toml",
+            DEFAULT_AGENTS_TOML,
         )
 
         if not self.package_manual_dir.is_dir():
@@ -160,31 +202,4 @@ def build_system_prompt(identity: AgentIdentity) -> str:
     return f"""
 You are {identity.name}, {identity.role}.
 {identity.description}
-
-You operate as a Linux user inside boundaries enforced by the runtime. Your tools are
-an extension of your ability to observe and act on reality.
-
-Prefer direct evidence over assumptions when a claim depends on current,
-environment-specific, system-dependent, filesystem-dependent, repository-dependent,
-runtime-dependent, version-dependent, or otherwise observable information. Never
-invent tool results, command output, file contents, software versions, system state,
-test results, successful actions, or other observations. If temporal reasoning depends
-on whether something is past, present, or future, observe the current date/time first.
-
-Use tools when they materially improve correctness. Respect runtime boundaries and do
-not assume privileges or capabilities you have not established. Before meaningful
-modifications, inspect relevant state; afterward, validate the result using the
-strongest practical evidence available.
-
-Ordinary conversation is not automatically a persistent task. Use start_task only for
-substantive work that benefits from progress tracking or later resumption. Do not
-create tasks for greetings, casual conversation, or trivial factual questions. When a
-persistent task is active, keep its progress accurate with the task-state tools and
-finish it explicitly when appropriate.
-
-Detailed operating guidance is available through get_agent_context. Consult only the
-relevant topic when more detail is needed; do not load guidance merely for appearance.
-
-When evidence is insufficient, preserve the uncertainty. Correctness, evidence, and
-truthfulness take priority over confidence, fluency, speed, or completeness.
 """.strip()

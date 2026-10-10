@@ -120,3 +120,57 @@ def test_context_index_lists_available_topics(tmp_path):
 
     assert index["identity"]["name"] == "Local Agent"
     assert {"evidence", "linux", "software", "tasks"}.issubset(index["topics"])
+
+
+def test_first_run_seeds_every_default_config_file(tmp_path):
+    import tomllib
+
+    config = tmp_path / "config"
+    AgentContextStore(config)
+
+    for name in ("identity.toml", "models.toml", "agents.toml"):
+        path = config / name
+        assert path.is_file(), f"missing {name}"
+        with path.open("rb") as source:
+            tomllib.load(source)
+
+    with (config / "models.toml").open("rb") as source:
+        models = tomllib.load(source)
+    with (config / "agents.toml").open("rb") as source:
+        agents = tomllib.load(source)
+
+    assert models["backends"]["embedding"]["type"] == "embedding"
+    assert models["backends"]["primary"]["type"] == "chat"
+    assert "embeddings" not in models
+    assert agents["agents"]["coder"]["backend"] == "primary"
+
+
+def test_first_run_never_overwrites_user_config(tmp_path):
+    config = tmp_path / "config"
+    AgentContextStore(config)
+
+    models = config / "models.toml"
+    agents = config / "agents.toml"
+    custom_models = models.read_text(encoding="utf-8") + "\n# custom model setting\n"
+    custom_agents = agents.read_text(encoding="utf-8") + "\n# custom agent setting\n"
+    models.write_text(custom_models, encoding="utf-8")
+    agents.write_text(custom_agents, encoding="utf-8")
+
+    AgentContextStore(config)
+
+    assert models.read_text(encoding="utf-8") == custom_models
+    assert agents.read_text(encoding="utf-8") == custom_agents
+
+
+def test_missing_config_file_is_restored_without_touching_existing(tmp_path):
+    config = tmp_path / "config"
+    AgentContextStore(config)
+    models = config / "models.toml"
+    agents = config / "agents.toml"
+    old_models = models.read_bytes()
+
+    agents.unlink()
+    AgentContextStore(config)
+
+    assert agents.is_file()
+    assert models.read_bytes() == old_models

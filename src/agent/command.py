@@ -13,7 +13,7 @@ class CommandExecutor:
     def __init__(
         self,
         workspace: str | Path,
-        timeout: float = 30.0,
+        timeout: float = 180.0,
         max_output: int = 64 * 1024,
     ):
         if timeout <= 0:

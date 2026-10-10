@@ -895,8 +895,22 @@ class AgentServer:
             return self.filesystem.delete_item(path)
 
         @self.mcp.tool()
-        async def run_command(command: str, timeout: float = 30.0) -> dict:
-            """Execute a shell command inside the workspace with bounded output."""
+        async def run_command(command: str, timeout: float = 180.0) -> dict:
+            """
+            Execute a shell command inside the workspace with bounded output.
+            
+            Args:
+                command:
+                    Shell command to execute.
+
+                timeout:
+                    By default 180 seconds. 
+                    Increase it for commands that might take a long time to finish.
+                    
+            Notes:
+                A short timeout can stop a command mid-way, but a very long timeout 
+                can waste a lot of time waiting for a command that might be stuck (e.g.: looping).
+            """
             executor = CommandExecutor(workspace=self.workspace.root, timeout=timeout)
             return await executor.run(command)
 

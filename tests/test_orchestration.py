@@ -411,14 +411,14 @@ max_reasoning_tokens = 1024
     assert summary["max_reasoning_tokens"] == 1024
 
 
-def test_registry_keeps_legacy_reasoning_budget_compatible(tmp_path):
+def test_registry_rejects_legacy_reasoning_budget(tmp_path):
     config = tmp_path / "config"
     config.mkdir()
     (config / "agents.toml").write_text(
         """
 [agents.legacy]
 name = "Legacy"
-description = "Uses the previous key."
+description = "Old key is forbidden."
 instructions = "Work carefully."
 tools = ["read_file"]
 reasoning_budget = 2048
@@ -426,9 +426,8 @@ reasoning_budget = 2048
         encoding="utf-8",
     )
 
-    spec = AgentRegistry.from_config_dir(config).get("legacy")
-    assert spec.max_context_tokens == 32768
-    assert spec.max_reasoning_tokens == 2048
+    with pytest.raises(ValueError, match="reasoning_budget is no longer supported"):
+        AgentRegistry.from_config_dir(config)
 
 
 def test_registry_rejects_reasoning_budget_larger_than_context(tmp_path):

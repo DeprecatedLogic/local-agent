@@ -4,12 +4,11 @@ import inspect
 
 from cysystemd import daemon
 
+from agent.backends import BackendRegistry
 from agent.chat import ChatSession
-from agent.embeddings import LlamaCppEmbeddingClient
 from agent.health import HealthMonitor
 from agent.logging_config import setup_logging
 from agent.mcp_.agent_server import AgentServer
-from agent.model import LlamaCppClient
 from agent.orchestration import (
     AgentRegistry,
     DelegationLimits,
@@ -42,26 +41,38 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--model-url",
-        default="http://127.0.0.1:8080",
-        help="Base URL of the llama-server instance.",
+        default=None,
+        help=(
+            "Override the primary model backend URL from models.toml "
+            "for this run."
+        ),
     )
 
     parser.add_argument(
         "--model",
-        default="local-agent",
-        help="Model identifier sent to llama-server.",
+        default=None,
+        help=(
+            "Override the primary model identifier from models.toml "
+            "for this run."
+        ),
     )
 
     parser.add_argument(
         "--embedding-url",
-        default="http://127.0.0.1:8081",
-        help="Base URL of the llama.cpp embedding server.",
+        default=None,
+        help=(
+            "Override the selected embedding backend URL from models.toml "
+            "for this run."
+        ),
     )
 
     parser.add_argument(
         "--embedding-model",
-        default="bge-small-en-v1.5",
-        help="Model identifier sent to the embedding server.",
+        default=None,
+        help=(
+            "Override the selected embedding model identifier from models.toml "
+            "for this run."
+        ),
     )
 
     parser.add_argument(
@@ -137,14 +148,16 @@ def create_runtime(
     args: argparse.Namespace,
     dry_run: bool = False,
 ) -> AgentRuntime:
-    embedding_provider = LlamaCppEmbeddingClient(
-        base_url=args.embedding_url,
-        model=args.embedding_model,
+    backend_registry = BackendRegistry.from_config_dir(args.config_dir)
+
+    embedding_provider = backend_registry.embedding_client(
+        url_override=args.embedding_url,
+        model_override=args.embedding_model,
     )
 
     server = AgentServer(
         args.workspace,
-        config_dir=args.config_dir,
+        config_dir=str(backend_registry.config_dir),
         embedding_provider=embedding_provider,
     )
 
@@ -189,10 +202,11 @@ def create_runtime(
                 },
             )
 
-    model = LlamaCppClient(
-        base_url=args.model_url,
-        model=args.model,
+    model_backends = backend_registry.model_clients(
+        primary_url_override=args.model_url,
+        primary_model_override=args.model,
     )
+    model = model_backends[backend_registry.primary_backend_id]
 
     registry = AgentRegistry.from_config_dir(
         server.context.config_dir
@@ -207,7 +221,7 @@ def create_runtime(
 
     delegation = DelegationManager(
         server,
-        {"primary": model},
+        model_backends,
         registry=registry,
         limits=DelegationLimits(
             max_delegations_per_turn=args.max_delegations,

@@ -23,14 +23,14 @@ class EmbeddingProvider(Protocol):
 
 
 class LlamaCppEmbeddingClient:
-    """Small OpenAI-compatible embedding client for llama-server."""
+    """OpenAI-compatible embedding client for llama-server."""
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8081",
         model: str = "bge-small-en-v1.5",
         *,
-        timeout: float = 30.0,
+        timeout: float = 180.0,
         query_prefix: str = BGE_QUERY_PREFIX,
     ):
         self.base_url = base_url.rstrip("/")
